@@ -129,3 +129,13 @@ Contributions welcome, especially for:
 - **Level/zone parsing** — `core/level.py` stubs need real section parsers
 
 Please open an issue before a large PR.
+
+---
+
+## Development Notes
+
+This project was conceived and directed by **ROStudios25**, who had the original idea of building a native PC tool for browsing and exporting Rift Apart assets without relying on Ninja Ripper.
+
+The initial codebase was developed with the assistance of **Claude AI** (Anthropic), translating the project concept into working Python code. All format research and struct definitions are sourced from the **ALERT** project by Tkachov and community reverse engineering work.
+
+In other words — the idea, direction, testing, and persistence were human. The Python was AI-assisted. Contributions from experienced developers to improve accuracy and performance are very welcome.
