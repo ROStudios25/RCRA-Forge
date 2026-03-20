@@ -1,0 +1,369 @@
+"""
+core/mesh.py
+Ratchet & Clank: Rift Apart PC — model/mesh parser.
+
+Written from ALERT source (dat1lib/types/sections/model/):
+  geo.py      — VertexesSection, IndexesSection, x6B855EED_Section
+  meshes.py   — MeshesSection, MeshDefinition
+  skin.py     — xCCBAFF15_Section (RCRA weights)
+  joints.py   — JointsSection, xDCC88A19_Section (transforms)
+
+Key facts:
+  - The asset is a DAT1 container (see core/archive.py)
+  - DAT1 unk1 = 0x98906B9F  →  'model'
+  - Vertex format for RCRA: 16 bytes per vertex, section 0xA98BE69B
+      <4h I 2h>   X Y Z W(ignored)  NXYZ(packed uint32)  U V
+      positions are fixed-point / 4096.0
+      normals are decoded from a 10-10-12 packed uint32 (see _decode_normal)
+      UVs are int16 / 32768.0
+  - Index buffer: uint16 values, section 0x0859863D (NOT delta-encoded for RCRA)
+  - Second UV channel: section 0x6B855EED, 2×int16 per vertex / 32768.0
+  - Vertex colours: section 0x5CBA9DE9, uint32 RGBA per vertex
+  - Mesh definitions: section 0x78D9CBDE, 64 bytes each
+  - RCRA skin weights: section 0xCCBAFF15, 8 bytes each
+    <B B B B  B B B B>  = bone0 bone1 bone2 bone3 weight0 weight1 weight2 weight3
+  - Joint definitions: section 0x15DF9D3B, 16 bytes each
+  - Joint transforms: section 0xDCC88A19 (3×4 + 4×4 float matrices)
+"""
+
+import math
+import struct
+import numpy as np
+from dataclasses import dataclass, field
+from typing import Optional
+
+from core.archive import DAT1, ASSET_TYPE_NAMES
+
+# ── DAT1 section tags for model assets ───────────────────────────────────────
+TAG_INDEXES         = 0x0859863D   # Model Index        — uint16 array
+TAG_VERTEXES        = 0xA98BE69B   # Model Std Vert     — 16B per vertex
+TAG_UV1             = 0x6B855EED   # Model UV1 Vert     — 4B per vertex (2×int16)
+TAG_COLORS          = 0x5CBA9DE9   # Model Col Vert     — 4B per vertex (uint32)
+TAG_MESHES          = 0x78D9CBDE   # Model Subset       — 64B each
+TAG_LOOK            = 0x3250BB80   # Model Look         — LOD/look table
+TAG_SKIN_BATCH      = 0xC61B1FF5   # Model Skin Batch   — 16B each
+TAG_SKIN_DATA       = 0xDCA379A2   # Model Skin Data    — variable
+TAG_RCRA_WEIGHTS    = 0xCCBAFF15   # RCRA weights       — 8B per vertex
+TAG_JOINTS          = 0x15DF9D3B   # Model Joint        — 16B each
+TAG_JOINT_XFORMS    = 0xDCC88A19   # Joint transforms   — (3×4 + 4×4) floats each
+TAG_BUILT           = 0x283D0383   # Model Built        — UV scale etc.
+TAG_MATERIALS       = 0x3250BB80   # Material names
+
+
+# ── Normal decoding (from ALERT geo.py _decode_normal) ────────────────────────
+
+def _decode_normal(norm: int) -> tuple:
+    """
+    Decode a 32-bit packed normal into (nx, ny, nz).
+    Encoding: bits[0:10]=nx, bits[10:20]=ny, bits[20:32]=nz(12b), bit[31]=flip
+    From ALERT dat1lib/types/sections/model/geo.py _decode_normal().
+    """
+    norm = norm & 0xFFFFFFFF
+    nx = float(norm & 0x3FF) * 0.00276483595 - math.sqrt(2)
+    ny = float((norm >> 10) & 0x3FF) * 0.00276483595 - math.sqrt(2)
+    flip = (norm >> 31) == 0
+
+    nxxyy = nx * nx + ny * ny
+    nw = 0.0
+    try:
+        nw = math.sqrt(max(0.0, 1.0 - 0.25 * nxxyy))
+    except Exception:
+        pass
+
+    nx = nx * nw
+    ny = ny * nw
+    nz = 1.0 - 0.5 * nxxyy
+    if flip:
+        nz = -nz
+
+    return (nx, ny, nz)
+
+
+# ── Data classes ──────────────────────────────────────────────────────────────
+
+@dataclass
+class Vertex:
+    x: float; y: float; z: float       # world-space position
+    nx: float; ny: float; nz: float    # decoded normal
+    u: float;  v: float                # UV channel 0
+    u1: float = 0.0; v1: float = 0.0  # UV channel 1 (if present)
+    r: int = 255; g: int = 255         # vertex colour
+    b: int = 255; a: int = 255
+
+
+@dataclass
+class MeshDefinition:
+    """One sub-mesh within a model. From ALERT MeshesSection (MSMR/RCRA variant)."""
+    mesh_id:           int
+    vertex_start:      int
+    vertex_count:      int
+    index_start:       int
+    index_count:       int
+    flags:             int    # 0x10 = indices are relative (not offset by vertex_start)
+    material_index:    int
+    first_skin_batch:  int
+    skin_batches_count: int
+    first_weight_index: int
+
+    @property
+    def indices_are_relative(self) -> bool:
+        return bool(self.flags & 0x10)
+
+
+@dataclass
+class JointDef:
+    parent:  int    # -1 = root
+    index:   int
+    name:    str
+    hash:    int
+
+
+@dataclass
+class ModelAsset:
+    vertexes:   list[Vertex]
+    meshes:     list[MeshDefinition]
+    indexes:    list[int]
+    joints:     list[JointDef]           = field(default_factory=list)
+    # joint transforms: list of (scale3, quat4, pos3) from matrixes34
+    joint_positions:  list[tuple] = field(default_factory=list)
+    joint_quaternions: list[tuple] = field(default_factory=list)
+    rcra_weights:     list         = field(default_factory=list)  # per-vertex list of (bone, weight) pairs
+    skin_data:        Optional[bytes] = None
+    skin_batches:     list = field(default_factory=list)
+
+
+# ── Parser ────────────────────────────────────────────────────────────────────
+
+class ModelParser:
+    """
+    Parse a raw model asset blob (DAT1 container) into a ModelAsset.
+
+    Usage:
+        data = toc_parser.extract_asset(entry)
+        model = ModelParser(data).parse()
+    """
+
+    def __init__(self, data: bytes):
+        self.dat1 = DAT1(data)
+
+    def parse(self) -> ModelAsset:
+        dat1 = self.dat1
+
+        vertexes   = self._parse_vertexes(dat1)
+        indexes    = self._parse_indexes(dat1)
+        meshes     = self._parse_meshes(dat1)
+        joints, jpos, jquat = self._parse_joints(dat1)
+        rcra_w     = self._parse_rcra_weights(dat1)
+        skin_data  = dat1.get_section(TAG_SKIN_DATA)
+        skin_batch = self._parse_skin_batches(dat1)
+
+        # Overlay UV1 channel if present
+        uv1_data = dat1.get_section(TAG_UV1)
+        if uv1_data:
+            for i in range(min(len(vertexes), len(uv1_data) // 4)):
+                u_raw, v_raw = struct.unpack_from('<hh', uv1_data, i * 4)
+                vertexes[i].u1 = u_raw / 32768.0
+                vertexes[i].v1 = v_raw / 32768.0
+
+        # Vertex colours
+        col_data = dat1.get_section(TAG_COLORS)
+        if col_data:
+            for i in range(min(len(vertexes), len(col_data) // 4)):
+                rgba = struct.unpack_from('<BBBB', col_data, i * 4)
+                vertexes[i].r, vertexes[i].g, vertexes[i].b, vertexes[i].a = rgba
+
+        return ModelAsset(
+            vertexes          = vertexes,
+            meshes            = meshes,
+            indexes           = indexes,
+            joints            = joints,
+            joint_positions   = jpos,
+            joint_quaternions = jquat,
+            rcra_weights      = rcra_w,
+            skin_data         = skin_data,
+            skin_batches      = skin_batch,
+        )
+
+    # ── Vertexes (section 0xA98BE69B) ─────────────────────────────────────────
+
+    def _parse_vertexes(self, dat1: DAT1) -> list[Vertex]:
+        data = dat1.get_section(TAG_VERTEXES)
+        if not data:
+            return []
+        vertexes = []
+        SCALE = 1.0 / 4096.0
+        UV_SCALE = 1.0 / 32768.0
+        for i in range(0, len(data) - 15, 16):
+            X, Y, Z, _W, NXYZ, U, V = struct.unpack_from('<4hI2h', data, i)
+            nx, ny, nz = _decode_normal(NXYZ)
+            vertexes.append(Vertex(
+                x  = X * SCALE, y  = Y * SCALE, z  = Z * SCALE,
+                nx = nx,        ny = ny,        nz = nz,
+                u  = U * UV_SCALE,
+                v  = V * UV_SCALE,
+            ))
+        return vertexes
+
+    # ── Indexes (section 0x0859863D) ──────────────────────────────────────────
+
+    def _parse_indexes(self, dat1: DAT1) -> list[int]:
+        data = dat1.get_section(TAG_INDEXES)
+        if not data:
+            return []
+        # RCRA uses plain uint16 (NOT delta-encoded, unlike MSMR)
+        count = len(data) // 2
+        return list(struct.unpack_from(f'<{count}H', data))
+
+    # ── Mesh definitions (section 0x78D9CBDE) ─────────────────────────────────
+
+    def _parse_meshes(self, dat1: DAT1) -> list[MeshDefinition]:
+        data = dat1.get_section(TAG_MESHES)
+        if not data:
+            return []
+        meshes = []
+        ENTRY_SIZE = 64
+        for i in range(len(data) // ENTRY_SIZE):
+            base = i * ENTRY_SIZE
+            # MSMR/RCRA variant (not SO):
+            # <I Q H H H H>  = unk, mesh_id, ?, ?, ?, ?   (20B)
+            _, mesh_id, _, _, _, _ = struct.unpack_from('<IQHHHH', data, base)
+            # <I I I I>  = vertexStart, indexStart, indexCount, vertexCount  (16B)
+            vs, ix_s, ix_c, vc = struct.unpack_from('<IIII', data, base + 20)
+            # <H H H H>  = flags, material_index, first_skin_batch, skin_batches_count  (8B)
+            flags, mat, fsb, sbc = struct.unpack_from('<HHHH', data, base + 36)
+            # (8B unknowns2)
+            # <I I>  = first_weight_index, unknown3  (8B)
+            fwi, _ = struct.unpack_from('<II', data, base + 56)
+
+            meshes.append(MeshDefinition(
+                mesh_id            = mesh_id,
+                vertex_start       = vs,
+                vertex_count       = vc,
+                index_start        = ix_s,
+                index_count        = ix_c,
+                flags              = flags,
+                material_index     = mat,
+                first_skin_batch   = fsb,
+                skin_batches_count = sbc,
+                first_weight_index = fwi,
+            ))
+        return meshes
+
+    # ── Joints (section 0x15DF9D3B) ───────────────────────────────────────────
+
+    def _parse_joints(self, dat1: DAT1):
+        joints_data = dat1.get_section(TAG_JOINTS)
+        xform_data  = dat1.get_section(TAG_JOINT_XFORMS)
+        if not joints_data:
+            return [], [], []
+
+        ENTRY_SIZE = 16
+        joints = []
+        for i in range(len(joints_data) // ENTRY_SIZE):
+            base = i * ENTRY_SIZE
+            parent, index, unk1, unk2, hash_val, str_off = struct.unpack_from('<hHHHII', joints_data, base)
+            name = self._read_string(dat1, str_off) or f"bone_{i}"
+            joints.append(JointDef(parent=parent, index=index, name=name, hash=hash_val))
+
+        positions  = []
+        quaternions = []
+        if xform_data:
+            # Each entry: 12 floats (3×4 matrix) + 16 floats (4×4 matrix)
+            ENTRY1 = 12 * 4   # 48B
+            ENTRY2 = 16 * 4   # 64B
+            count  = len(joints)
+            for i in range(count):
+                m34 = struct.unpack_from('<12f', xform_data, i * ENTRY1)
+                # scale = m34[0:3], quaternion = m34[4:8], position = m34[8:11]
+                positions.append(m34[8:11])
+                quaternions.append(m34[4:8])
+
+            # 4×4 matrices start after all 3×4 matrices
+            off44 = ENTRY1 * count
+            align = off44 % ENTRY2
+            if align != 0:
+                off44 += ENTRY2 - align
+
+        return joints, positions, quaternions
+
+    # ── RCRA skin weights (section 0xCCBAFF15) ────────────────────────────────
+
+    def _parse_rcra_weights(self, dat1: DAT1) -> list:
+        data = dat1.get_section(TAG_RCRA_WEIGHTS)
+        if not data:
+            return []
+        weights = []
+        for i in range(len(data) // 8):
+            b1, b2, b3, b4, w1, w2, w3, w4 = struct.unpack_from('<8B', data, i * 8)
+            sm = w1 + w2 + w3 + w4
+            entries = {}
+            for bone, w in [(b1,w1),(b2,w2),(b3,w3),(b4,w4)]:
+                if w > 0:
+                    entries[bone] = entries.get(bone, 0) + w
+            if sm > 0:
+                result = [(b, w/sm) for b, w in entries.items()]
+            else:
+                result = []
+            weights.append(sorted(result, key=lambda x: -x[1]))
+        return weights
+
+    # ── Skin batches (section 0xC61B1FF5) ─────────────────────────────────────
+
+    def _parse_skin_batches(self, dat1: DAT1) -> list:
+        data = dat1.get_section(TAG_SKIN_BATCH)
+        if not data:
+            return []
+        batches = []
+        for i in range(len(data) // 16):
+            offset, z1, z2, unk1, vertex_count, first_vertex = \
+                struct.unpack_from('<IIHHHH', data, i * 16)
+            batches.append({
+                'offset': offset, 'vertex_count': vertex_count,
+                'first_vertex': first_vertex
+            })
+        return batches
+
+    # ── String table helper ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _read_string(dat1: DAT1, offset: int) -> Optional[str]:
+        """Read a null-terminated UTF-8 string from the DAT1 string table."""
+        # String table is between end of header directory and first section
+        # We search from byte 0 of the dat1 data at the given absolute offset
+        d = dat1.data
+        if offset >= len(d):
+            return None
+        end = d.find(b'\x00', offset)
+        if end < 0:
+            end = len(d)
+        try:
+            return d[offset:end].decode('utf-8', errors='replace')
+        except Exception:
+            return None
+
+
+# ── Convenience: build per-mesh numpy arrays for the exporter ─────────────────
+
+def mesh_to_numpy(model: ModelAsset, mesh: MeshDefinition):
+    """
+    Return (positions, normals, uvs, indices) as numpy arrays for one sub-mesh.
+    Handles both relative and vertex-offset index modes.
+    """
+    vs = mesh.vertex_start
+    vc = mesh.vertex_count
+    verts = model.vertexes[vs:vs + vc]
+    if not verts:
+        return None, None, None, None
+
+    positions = np.array([(v.x, v.y, v.z) for v in verts], dtype=np.float32)
+    normals   = np.array([(v.nx, v.ny, v.nz) for v in verts], dtype=np.float32)
+    uvs       = np.array([(v.u, v.v) for v in verts], dtype=np.float32)
+
+    raw_idx = model.indexes[mesh.index_start:mesh.index_start + mesh.index_count]
+    if not raw_idx:
+        return positions, normals, uvs, None
+
+    offset = 0 if mesh.indices_are_relative else mesh.vertex_start
+    indices = np.array([max(0, i - offset) for i in raw_idx], dtype=np.uint32)
+
+    return positions, normals, uvs, indices

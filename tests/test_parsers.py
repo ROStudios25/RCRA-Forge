@@ -1,0 +1,164 @@
+"""
+tests/test_parsers.py
+Unit tests for RCRA Forge using the new ALERT-accurate API.
+Run with:  python tests/test_parsers.py
+       or: python -m pytest tests/ -v
+"""
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+
+def test_sphere_model():
+    from tests.dummy_data import make_sphere_model
+    from core.mesh import mesh_to_numpy
+
+    model = make_sphere_model(rings=8, sectors=12)
+    assert len(model.meshes) == 1
+    assert len(model.vertexes) > 0
+    assert len(model.indexes)  > 0
+
+    mesh = model.meshes[0]
+    pos, nrm, uvs, idx = mesh_to_numpy(model, mesh)
+    assert pos is not None and len(pos) > 0
+    assert idx is not None and len(idx) > 0
+    assert idx.max() < len(pos), "Index out of range"
+
+    print(f"  ✓ Sphere: {len(pos)} verts, {len(idx)//3} tris")
+
+
+def test_cube_model():
+    from tests.dummy_data import make_cube_model
+    from core.mesh import mesh_to_numpy
+
+    model = make_cube_model()
+    pos, nrm, uvs, idx = mesh_to_numpy(model, model.meshes[0])
+    assert len(pos) == 24
+    assert len(idx) == 36
+    assert idx.max() < 24
+    print(f"  ✓ Cube: {len(pos)} verts, {len(idx)//3} tris")
+
+
+def test_texture_checkerboard():
+    from tests.dummy_data import make_checkerboard_texture
+
+    tex = make_checkerboard_texture(64)
+    assert tex.width  == 64
+    assert tex.height == 64
+    assert len(tex.pixel_data) == 64 * 64 * 4
+    assert tex.format_name == 'R8G8B8A8_UNORM'
+    print(f"  ✓ Texture: {tex.width}×{tex.height} {tex.format_name}")
+
+
+def test_texture_dds_export():
+    from tests.dummy_data import make_checkerboard_texture
+
+    tex = make_checkerboard_texture(32)
+    dds = tex.to_dds_bytes()
+    assert dds[:4] == b'DDS ', f"Bad DDS magic: {dds[:4]!r}"
+    assert len(dds) > 128
+    print(f"  ✓ DDS export: {len(dds):,} bytes")
+
+
+def test_skeleton():
+    from tests.dummy_data import make_demo_skeleton
+
+    skel = make_demo_skeleton()
+    assert len(skel.bones) == 5
+    roots = skel.root_bones()
+    assert len(roots) == 1
+    assert roots[0].name == "root"
+
+    world = skel.world_positions()
+    assert len(world) == 5
+    assert all(len(v) == 3 for v in world.values())
+    print(f"  ✓ Skeleton: {len(skel.bones)} bones, root='{roots[0].name}'")
+
+
+def test_dat1_parse():
+    from tests.dummy_data import make_fake_toc_dat1
+    from core.archive import DAT1, TAG_ARCHIVES, TAG_ASSET_IDS, TAG_SIZES
+
+    dat1_bytes = make_fake_toc_dat1()
+    dat1 = DAT1(dat1_bytes)
+
+    assert dat1.get_section(TAG_ARCHIVES)  is not None, "Missing archives section"
+    assert dat1.get_section(TAG_ASSET_IDS) is not None, "Missing asset IDs section"
+    assert dat1.get_section(TAG_SIZES)     is not None, "Missing sizes section"
+    print(f"  ✓ DAT1 parse: {len(dat1.sections)} sections found")
+
+
+def test_gltf_export():
+    import tempfile
+    from tests.dummy_data import make_sphere_model
+    from exporters.gltf_exporter import GltfExporter, ObjExporter
+
+    model = make_sphere_model(rings=6, sectors=10)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        glb_path = os.path.join(tmpdir, "sphere.glb")
+        GltfExporter(model, "sphere").export_glb(glb_path)
+        assert os.path.exists(glb_path)
+        size = os.path.getsize(glb_path)
+        assert size > 200, f"GLB too small: {size} bytes"
+        # Verify GLB magic
+        with open(glb_path, 'rb') as f:
+            magic = f.read(4)
+        assert magic == b'glTF', f"Bad GLB magic: {magic!r}"
+        print(f"  ✓ GLB export: {size:,} bytes")
+
+        obj_path = os.path.join(tmpdir, "sphere.obj")
+        ObjExporter(model, "sphere").export(obj_path)
+        assert os.path.exists(obj_path)
+        content = open(obj_path).read()
+        v_count = content.count('\nv ')
+        f_count = content.count('\nf ')
+        assert v_count > 0
+        assert f_count > 0
+        print(f"  ✓ OBJ export: {v_count} vertices, {f_count} faces")
+
+
+def test_crc64_hash():
+    from core.archive import crc64_hash
+    # Known hash from ALERT: characters/npc/npc_zurkon_jr/npc_zurkon_jr.model
+    # = 0x94A4B69B67D5CC42  (mentioned in the PR discussion)
+    h = crc64_hash("characters/npc/npc_zurkon_jr/npc_zurkon_jr.model")
+    assert h == 0x94A4B69B67D5CC42, f"CRC64 mismatch: {h:#018x}"
+    print(f"  ✓ CRC64 hash: {h:#018x}")
+
+
+def run_all():
+    tests = [
+        test_sphere_model,
+        test_cube_model,
+        test_texture_checkerboard,
+        test_texture_dds_export,
+        test_skeleton,
+        test_dat1_parse,
+        test_gltf_export,
+        test_crc64_hash,
+    ]
+    passed = failed = 0
+    print("\n" + "━"*50)
+    print("  RCRA Forge — Test Suite")
+    print("━"*50 + "\n")
+    for test in tests:
+        try:
+            print(f"[RUN] {test.__name__}")
+            test()
+            passed += 1
+        except Exception as e:
+            import traceback
+            print(f"  ✗ FAILED: {e}")
+            traceback.print_exc()
+            failed += 1
+    print(f"\n{'━'*50}")
+    print(f"  {passed}/{len(tests)} passed  {'🟢' if failed == 0 else '🔴'}")
+    print("━"*50 + "\n")
+    return failed == 0
+
+
+if __name__ == "__main__":
+    ok = run_all()
+    sys.exit(0 if ok else 1)
