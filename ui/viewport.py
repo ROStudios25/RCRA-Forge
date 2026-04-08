@@ -77,20 +77,55 @@ void main() {
 GRID_VERT = """
 #version 330 core
 layout(location=0) in vec3 aPos;
-uniform mat4 uVP;
-out float vFade;
+uniform mat4 uInvVP;
+out vec3 vNear;
+out vec3 vFar;
+
+vec3 unproject(float x, float y, float z, mat4 invVP) {
+    vec4 v = invVP * vec4(x, y, z, 1.0);
+    return v.xyz / v.w;
+}
+
 void main() {
-    gl_Position = uVP * vec4(aPos, 1.0);
-    vFade = 1.0 - clamp(length(aPos.xz) / 50.0, 0.0, 1.0);
+    gl_Position = vec4(aPos, 1.0);
+    vNear = unproject(aPos.x, aPos.y, -1.0, uInvVP);
+    vFar  = unproject(aPos.x, aPos.y,  1.0, uInvVP);
 }
 """
 
 GRID_FRAG = """
 #version 330 core
-in float vFade;
+in vec3 vNear;
+in vec3 vFar;
+uniform float uGridY;
 out vec4 FragColor;
+
+float gridLine(vec2 uv, float scale) {
+    vec2 grid = abs(fract(uv / scale - 0.5) - 0.5) / fwidth(uv / scale);
+    return min(grid.x, grid.y);
+}
+
 void main() {
-    FragColor = vec4(0.3, 0.35, 0.4, vFade * 0.6);
+    // Intersect ray with Y=uGridY plane
+    float t = (uGridY - vNear.y) / (vFar.y - vNear.y);
+    if (t <= 0.0) discard;
+
+    vec3 pos = vNear + t * (vFar - vNear);
+    float dist = length(pos - vNear);
+
+    // Two grid levels
+    float g1 = gridLine(pos.xz, 1.0);
+    float g2 = gridLine(pos.xz, 0.1);
+    float line = min(g1, g2);
+
+    float alpha = (1.0 - min(line, 1.0)) * (1.0 - smoothstep(0.0, 80.0, dist));
+    if (alpha < 0.01) discard;
+
+    vec3 col = vec3(0.5, 0.55, 0.65);
+    // Brighter for major grid lines (every 1 unit)
+    if (g2 > g1) col = vec3(0.6, 0.65, 0.75);
+
+    FragColor = vec4(col, alpha * 0.85);
 }
 """
 
@@ -125,18 +160,20 @@ class ArcballCamera:
         ], dtype=np.float32) * self.dist
 
     def orbit(self, dx: float, dy: float):
-        self.yaw   += dx * 0.5
-        self.pitch  = max(-89, min(89, self.pitch - dy * 0.5))
+        self.yaw   += dx * 0.4
+        self.pitch  = max(-89, min(89, self.pitch - dy * 0.4))
 
     def pan(self, dx: float, dy: float):
         right = np.array([math.cos(math.radians(self.yaw)), 0,
                           -math.sin(math.radians(self.yaw))], np.float32)
         up    = np.array([0, 1, 0], np.float32)
-        speed = self.dist * 0.002
+        speed = self.dist * 0.001
         self.target += (-right * dx + up * dy) * speed
 
     def zoom(self, delta: float):
-        self.dist = max(0.1, self.dist * (1.0 - delta * 0.1))
+        # Scale zoom speed by current distance so large models zoom at reasonable speed
+        factor = 1.0 - delta * 0.15
+        self.dist = max(0.01, self.dist * factor)
 
     def frame_aabb(self, mn: np.ndarray, mx: np.ndarray):
         self.target = (mn + mx) * 0.5
@@ -231,34 +268,34 @@ class Viewport3D(QOpenGLWidget):
         self._grid_count:  int = 0
         self._last_pos:    Optional[QPoint] = None
         self._mouse_mode:  str = 'orbit'
+        self._dragging:    bool = False
         self._wireframe:   bool = False
-        self._pending_model = None
+        self._pending_model  = None
         self._redraw_pending = False
+        self._grid_y         = 0.0
+        self._grid_fade_r    = 2.0
         self.setMinimumSize(400, 300)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.WheelFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_PaintOnScreen, True)
-        # Use NoPartialUpdate so Qt doesn't composite on top of OpenGL
-        self.setUpdateBehavior(
-            QOpenGLWidget.UpdateBehavior.NoPartialUpdate
-        )
+        self.setUpdateBehavior(QOpenGLWidget.UpdateBehavior.NoPartialUpdate)
 
     def _redraw(self):
-        """Force an immediate redraw using direct GL calls."""
-        self.makeCurrent()
-        self.paintGL()
-        self.doneCurrent()
+        """Request a repaint through Qt's paint system."""
+        self.update()
 
-    def _schedule_redraw(self):
-        """Throttled redraw — coalesces rapid mouse moves into one paint."""
-        if not self._redraw_pending:
-            self._redraw_pending = True
+    def _start_render_loop(self):
+        if not hasattr(self, '_render_timer'):
             from PyQt6.QtCore import QTimer
-            QTimer.singleShot(8, self._do_scheduled_redraw)  # ~120fps cap
+            self._render_timer = QTimer(self)
+            self._render_timer.timeout.connect(self.update)
+        if not self._render_timer.isActive():
+            self._render_timer.start(16)  # 60fps
 
-    def _do_scheduled_redraw(self):
-        self._redraw_pending = False
-        self._redraw()
+    def _stop_render_loop(self):
+        if hasattr(self, '_render_timer') and self._render_timer.isActive():
+            self._render_timer.stop()
 
     # ── Mesh Loading ──────────────────────────────────────────────────────────
 
@@ -310,6 +347,7 @@ class Viewport3D(QOpenGLWidget):
             mn, mx = pts.min(axis=0), pts.max(axis=0)
             self._aabb_min = mn
             self._aabb_max = mx
+            self._grid_y   = 0.0  # always at world origin
             self.camera.frame_aabb(mn, mx)
 
     def frame_model(self):
@@ -328,16 +366,18 @@ class Viewport3D(QOpenGLWidget):
         """Set camera to a named preset view."""
         presets = {
             'main':   ( 45,  25),
-            'front':  ( 90,   0),   # confirmed opposite of back (270)
-            'back':   (270,   0),   # confirmed yaw=270
-            'right':  (180,   0),   # confirmed yaw=0 was left, so right=180
-            'left':   (  0,   0),   # confirmed yaw=0
+            'front':  ( 90,   0),
+            'back':   (270,   0),
+            'right':  (180,   0),
+            'left':   (  0,   0),
             'top':    (  0,  89),
             'bottom': (  0, -89),
         }
         if preset in presets:
             self.camera.yaw, self.camera.pitch = presets[preset]
             self._redraw()
+
+    def clear_mesh(self):
         self.makeCurrent()
         self._free_gpu_meshes()
         self.doneCurrent()
@@ -366,7 +406,7 @@ class Viewport3D(QOpenGLWidget):
         gf = compileShader(GRID_FRAG, GL_FRAGMENT_SHADER)
         self._grid_prog = compileProgram(gv, gf)
 
-        self._build_grid(50, 2.0)
+        self._build_grid(20, 0.2)
 
     def resizeGL(self, w: int, h: int):
         glViewport(0, 0, w, h)
@@ -393,13 +433,20 @@ class Viewport3D(QOpenGLWidget):
         light_dir = np.array([0.6, 1.0, 0.8], np.float32)
         light_dir /= np.linalg.norm(light_dir)
 
-        # Draw grid
+        # Draw infinite grid using full-screen quad + fragment shader
+        glDisable(GL_DEPTH_TEST)
         glUseProgram(self._grid_prog)
-        _set_uniform_mat4(self._grid_prog, 'uVP', vp)
+        # Pass inverse VP so shader can reconstruct world rays
+        inv_vp = np.linalg.inv(vp).astype(np.float32)
+        _set_uniform_mat4(self._grid_prog, 'uInvVP', inv_vp)
+        grid_y = getattr(self, '_grid_y', 0.0)
+        loc = glGetUniformLocation(self._grid_prog, 'uGridY')
+        if loc >= 0: glUniform1f(loc, grid_y)
         if self._grid_vao:
             glBindVertexArray(self._grid_vao)
-            glDrawArrays(GL_LINES, 0, self._grid_count)
+            glDrawArrays(GL_TRIANGLES, 0, self._grid_count)
             glBindVertexArray(0)
+        glEnable(GL_DEPTH_TEST)
 
         # Draw meshes
         if self._gpu_meshes:
@@ -424,16 +471,20 @@ class Viewport3D(QOpenGLWidget):
     # ── Mouse Input ───────────────────────────────────────────────────────────
 
     def mousePressEvent(self, e: QMouseEvent):
-        self._last_pos = e.pos()
-        if e.buttons() & Qt.MouseButton.MiddleButton:
+        self.setFocus()
+        self._last_pos   = e.pos()
+        self._dragging   = True
+        if e.buttons() & Qt.MouseButton.RightButton:
             self._mouse_mode = 'pan'
-        elif e.buttons() & Qt.MouseButton.RightButton:
-            self._mouse_mode = 'orbit'
         else:
             self._mouse_mode = 'orbit'
+        self._start_render_loop()
 
     def mouseMoveEvent(self, e: QMouseEvent):
-        if self._last_pos is None:
+        if not self._dragging or self._last_pos is None:
+            return
+        if not e.buttons():
+            self._dragging = False
             return
         dx = e.pos().x() - self._last_pos.x()
         dy = e.pos().y() - self._last_pos.y()
@@ -442,8 +493,6 @@ class Viewport3D(QOpenGLWidget):
         else:
             self.camera.pan(dx, dy)
         self._last_pos = e.pos()
-        self._schedule_redraw()
-        # Show angles in status bar for calibration
         try:
             win = self.window()
             if hasattr(win, '_status_lbl'):
@@ -454,7 +503,10 @@ class Viewport3D(QOpenGLWidget):
             pass
 
     def mouseReleaseEvent(self, e: QMouseEvent):
+        self._dragging = False
         self._last_pos = None
+        self._stop_render_loop()
+        self.update()
 
     def wheelEvent(self, e: QWheelEvent):
         delta = e.angleDelta().y() / 120.0
@@ -468,13 +520,12 @@ class Viewport3D(QOpenGLWidget):
             gm.free()
         self._gpu_meshes.clear()
 
-    def _build_grid(self, half_size: int, spacing: float):
-        lines = []
-        for i in range(-half_size, half_size + 1):
-            x = i * spacing
-            lines += [x, 0, -half_size * spacing,  x, 0, half_size * spacing]
-            lines += [-half_size * spacing, 0, x,   half_size * spacing, 0, x]
-        verts = np.array(lines, dtype=np.float32)
+    def _build_grid(self, half_size: int = 10, spacing: float = 0.1):
+        """Build a full-screen quad for the infinite grid fragment shader."""
+        verts = np.array([
+            -1, -1, 0,   1, -1, 0,   1,  1, 0,
+            -1, -1, 0,   1,  1, 0,  -1,  1, 0,
+        ], dtype=np.float32)
 
         self._grid_vao = glGenVertexArrays(1)
         self._grid_vbo = glGenBuffers(1)
@@ -484,7 +535,7 @@ class Viewport3D(QOpenGLWidget):
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 12, None)
         glEnableVertexAttribArray(0)
         glBindVertexArray(0)
-        self._grid_count = len(verts) // 3
+        self._grid_count = 6
 
 
 # ── Math helpers ──────────────────────────────────────────────────────────────
