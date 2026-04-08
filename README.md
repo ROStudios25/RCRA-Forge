@@ -1,6 +1,6 @@
 # RCRA Forge
 
-**Ratchet & Clank: Rift Apart — Level Editor & Asset Exporter (PC)**
+**Ratchet & Clank: Rift Apart — Level Editor & Asset Exporter (PC)** — v0.2.0
 
 A Python/PyQt6 desktop application for browsing, previewing, and exporting assets from the PC version of Ratchet & Clank: Rift Apart — without needing Ninja Ripper.
 
@@ -12,8 +12,8 @@ A Python/PyQt6 desktop application for browsing, previewing, and exporting asset
 
 | Panel | Description |
 |---|---|
-| **Asset Browser** | Parses the game's `toc` file, lists all assets grouped by archive |
-| **3D Viewport** | PyOpenGL viewer — right-drag orbit, middle-drag pan, scroll zoom, wireframe |
+| **Asset Browser** | Parses the game's `toc` file in ~0.03s, lists all 340,661 assets with real names from `hashes.txt` |
+| **3D Viewport** | PyOpenGL viewer — right-drag orbit, middle-drag pan, scroll zoom, wireframe toggle, view presets |
 | **Texture Viewer** | Decodes BCn/DDS textures, exports `.dds` |
 | **Scene Panel** | Shows DAT1 section info for level/zone assets |
 | **Skeleton Viewer** | Bone hierarchy tree with 2D rest-pose projection |
@@ -22,28 +22,47 @@ A Python/PyQt6 desktop application for browsing, previewing, and exporting asset
 
 ---
 
+## What's New in v0.2.0
+
+- ✅ **3D viewport working** — models render correctly with per-mesh colors and lighting
+- ✅ **Camera controls** — orbit (right-drag), pan (middle-drag), zoom (scroll wheel)
+- ✅ **View presets** — Main, Front, Back, Right, Left, Top, Bottom
+- ✅ **Wireframe mode** — toggle in toolbar
+- ✅ **Frame button** — resets camera to fit loaded model
+- ✅ **Asset name lookup** — `hashes.txt` integration shows real filenames (384,260 entries)
+- ✅ **TOC loads instantly** — ~0.03 seconds for 340,661 assets
+- ✅ **Fixed ModelRcra** — correct magic `0x9D2C0FA9` for Rift Apart models
+- ✅ **Fixed DAT1 parsing** — handles header blob offset correctly
+
+---
+
 ## Known Issues
 
-### 🐛 TOC loading is slow
-The `toc` file parses correctly but takes longer than expected even on fast NVMe hardware (Ryzen 9 5950X). The file read itself is instant — the bottleneck is somewhere in the Python DAT1 parsing pipeline.
-
-**Help wanted:** If you have experience with Rift Apart's TOC/DAT1 format (e.g. from ALERT or ripped_apart), profiling help would be very appreciated. Relevant code: `core/archive.py` → `TocParser._build_entries()`.
-
-Timing breakdown is shown in the status bar after load: `disk:Xs  dat1:Xs  index:Xs`
-
-### 🐛 Model viewport may show blank
-The RCRA vertex format (16B: `<4h I 2h>`) is decoded in `core/mesh.py`. If models show blank after double-clicking, the vertex/index parsing may need adjustment. Use the **Hex Inspector** tab to inspect raw DAT1 bytes and compare against [ALERT's geo.py](https://github.com/Tkachov/ALERT/blob/main/dat1lib/types/sections/model/geo.py).
+### 🐛 Grid not visible in viewport
+The floor grid renders but may not be visible depending on scene scale.
 
 ### 🐛 Textures show as blank
 Rift Apart texture pixel data is split across the DAT1 asset and a separate HD archive. The HD pixel data read is not yet fully implemented.
+
+### 🐛 GDeflate decompression unavailable
+Assets in GDeflate-compressed archives (`comp_type=2`) cannot be extracted until the `gdeflate` Python module is available.
+
+---
+
+## Requirements
+
+- Python 3.10+
+- PyQt6, PyOpenGL, NumPy (see `requirements.txt`)
+- **Ratchet & Clank: Rift Apart** (Steam PC)
+- **`hashes.txt`** from [Overstrike/Overdrive](https://github.com/Tkachov/overstrike) — **required** for asset names. Without it, all assets show as raw hex IDs. Place it in the same folder as the game's `toc` file or next to the RCRA Forge executable.
 
 ---
 
 ## Installation (from source)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/rcra-forge
-cd rcra-forge
+git clone https://github.com/ROStudios25/RCRA-Forge
+cd RCRA-Forge
 python -m venv .venv
 .venv\Scripts\activate      # Windows
 pip install -r requirements.txt
@@ -68,10 +87,12 @@ python demo.py
 ## Usage
 
 1. **File → Open Game Folder** → select your Rift Apart Steam install directory
-2. Wait for the TOC to load — assets appear grouped by archive number
-3. **Double-click** any asset to load it into the viewer
-4. Use the search box to find a specific asset by hex ID
-5. Select export format (GLB/GLTF/OBJ) in the Properties panel and click **Export Asset**
+2. Wait for the TOC to load (~0.03s) — assets appear grouped by archive with real filenames
+3. Use the **search box** to find assets by name (e.g. `zurkon`) or hex ID
+4. Use the **type filter** to narrow by extension (`.model`, `.texture`, `.zone`, etc.)
+5. **Double-click** any asset to load it into the 3D viewer
+6. Use **right-drag** to orbit, **middle-drag** to pan, **scroll** to zoom
+7. Select export format (GLB/GLTF/OBJ) in the Properties panel and click **Export Asset**
 
 ### Known test assets (from [ALERT PR #17](https://github.com/Tkachov/ALERT/pull/17))
 
@@ -129,13 +150,3 @@ Contributions welcome, especially for:
 - **Level/zone parsing** — `core/level.py` stubs need real section parsers
 
 Please open an issue before a large PR.
-
----
-
-## Development Notes
-
-This project was conceived and directed by **ROStudios25**, who had the original idea of building a native PC tool for browsing and exporting Rift Apart assets without relying on Ninja Ripper.
-
-The initial codebase was developed with the assistance of **Claude AI** (Anthropic), translating the project concept into working Python code. All format research and struct definitions are sourced from the **ALERT** project by Tkachov and community reverse engineering work.
-
-In other words — the idea, direction, testing, and persistence were human. The Python was AI-assisted. Contributions from experienced developers to improve accuracy and performance are very welcome.

@@ -46,24 +46,27 @@ class SkeletonCanvas(QWidget):
     # ── Paint ─────────────────────────────────────────────────────────────────
 
     def paintEvent(self, e):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.fillRect(self.rect(), QColor("#13151a"))
+        try:
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.fillRect(self.rect(), QColor("#13151a"))
 
-        if not self._skel or not self._world_pos:
-            p.setPen(QColor("#405060"))
-            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No skeleton loaded")
+            if not self._skel or not self._world_pos:
+                p.setPen(QColor("#405060"))
+                p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No skeleton loaded")
+                p.end()
+                return
+
+            positions = self._world_pos
+            if not positions:
+                p.end()
+                return
+
+            pts3d = np.array(list(positions.values()))
+            self._draw_projection(p, positions, proj='xy')
             p.end()
-            return
-
-        positions = self._world_pos
-        if not positions:
-            p.end()
-            return
-
-        pts3d = np.array(list(positions.values()))
-        self._draw_projection(p, positions, proj='xy')
-        p.end()
+        except Exception:
+            pass
 
     def _draw_projection(self, p: QPainter, world_pos: dict, proj: str = 'xy'):
         pts = {idx: self._project(v, proj) for idx, v in world_pos.items()}
@@ -92,9 +95,9 @@ class SkeletonCanvas(QWidget):
         p.setFont(QFont("Consolas", 7))
 
         for bone in self._skel.bones:
-            if bone.parent_index == 0xFFFF or bone.parent_index not in pts:
+            if bone.parent == -1 or bone.parent not in pts:
                 continue
-            a = to_screen(pts[bone.parent_index])
+            a = to_screen(pts[bone.parent])
             b = to_screen(pts[bone.index])
             p.setPen(pen_sel if bone.index == self._selected else pen_bone)
             p.drawLine(a, b)

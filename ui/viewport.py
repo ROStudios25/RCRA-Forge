@@ -68,12 +68,8 @@ void main() {
         return;
     }
     vec3 n    = normalize(vNormal);
-    float NdL = max(dot(n, normalize(uLightDir)), 0.0);
-    vec3 ambient = uBaseColor * 0.25;
-    vec3 diffuse = uBaseColor * NdL;
-    vec3 col     = ambient + diffuse;
-    // Rim
-    col += vec3(0.05, 0.1, 0.2) * pow(1.0 - abs(dot(n, vec3(0,0,1))), 3.0);
+    float NdL = max(dot(n, normalize(uLightDir)), 0.15);
+    vec3 col  = uBaseColor * NdL + uBaseColor * 0.3;
     FragColor = vec4(col, 1.0);
 }
 """
@@ -234,45 +230,122 @@ class Viewport3D(QOpenGLWidget):
         self._grid_vbo:    int = 0
         self._grid_count:  int = 0
         self._last_pos:    Optional[QPoint] = None
-        self._mouse_mode:  str = 'orbit'   # 'orbit' | 'pan'
+        self._mouse_mode:  str = 'orbit'
         self._wireframe:   bool = False
+        self._pending_model = None
+        self._redraw_pending = False
         self.setMinimumSize(400, 300)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_PaintOnScreen, True)
+        # Use NoPartialUpdate so Qt doesn't composite on top of OpenGL
+        self.setUpdateBehavior(
+            QOpenGLWidget.UpdateBehavior.NoPartialUpdate
+        )
+
+    def _redraw(self):
+        """Force an immediate redraw using direct GL calls."""
+        self.makeCurrent()
+        self.paintGL()
+        self.doneCurrent()
+
+    def _schedule_redraw(self):
+        """Throttled redraw — coalesces rapid mouse moves into one paint."""
+        if not self._redraw_pending:
+            self._redraw_pending = True
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(8, self._do_scheduled_redraw)  # ~120fps cap
+
+    def _do_scheduled_redraw(self):
+        self._redraw_pending = False
+        self._redraw()
 
     # ── Mesh Loading ──────────────────────────────────────────────────────────
 
     def load_mesh(self, model: ModelAsset):
-        self.makeCurrent()
-        self._free_gpu_meshes()
+        """Queue a model for GPU upload — actual upload happens in paintGL."""
+        self._pending_model = model
+        if hasattr(self, '_cam_logged'):
+            del self._cam_logged
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(10, self._trigger_repaint)
 
+    def _trigger_repaint(self):
+        self._redraw()
+
+    def _upload_pending_model(self):
+        """Called from paintGL — upload pending model with GL context active."""
+        model = self._pending_model
+        self._pending_model = None
+
+        self._free_gpu_meshes()
         all_positions = []
+        skipped = 0
+
         for i, mesh in enumerate(model.meshes):
             positions, normals, uvs, indices = mesh_to_numpy(model, mesh)
             if positions is None or indices is None or len(positions) == 0:
+                skipped += 1
                 continue
             gpu = GpuSubMesh()
-            gpu.upload(positions, normals, uvs, indices)
+            try:
+                gpu.upload(positions, normals, uvs, indices)
+                if gpu.vao == 0:
+                    skipped += 1
+                    continue
+            except Exception as e:
+                print(f"[viewport] mesh {i} upload failed: {e}")
+                skipped += 1
+                continue
             hue = (i * 0.618033) % 1.0
             r, g, b = _hsv_to_rgb(hue, 0.4, 0.85)
             gpu.color = (r, g, b)
             self._gpu_meshes.append(gpu)
             all_positions.append(positions)
 
+        print(f"[viewport] {len(self._gpu_meshes)} GPU meshes, {skipped} skipped")
+
         if all_positions:
             pts = np.concatenate(all_positions)
-            self.camera.frame_aabb(pts.min(axis=0), pts.max(axis=0))
+            mn, mx = pts.min(axis=0), pts.max(axis=0)
+            self._aabb_min = mn
+            self._aabb_max = mx
+            self.camera.frame_aabb(mn, mx)
 
-        self.doneCurrent()
-        self.update()
+    def frame_model(self):
+        """Reset camera to frame the loaded model."""
+        if self._gpu_meshes:
+            # Re-frame from stored AABB
+            if hasattr(self, '_aabb_min') and hasattr(self, '_aabb_max'):
+                self.camera.frame_aabb(self._aabb_min, self._aabb_max)
+                self._redraw()
+        else:
+            self.camera.target = np.zeros(3, dtype=np.float32)
+            self.camera.dist   = 5.0
+            self._redraw()
 
-    def clear_mesh(self):
+    def set_view_preset(self, preset: str):
+        """Set camera to a named preset view."""
+        presets = {
+            'main':   ( 45,  25),
+            'front':  ( 90,   0),   # confirmed opposite of back (270)
+            'back':   (270,   0),   # confirmed yaw=270
+            'right':  (180,   0),   # confirmed yaw=0 was left, so right=180
+            'left':   (  0,   0),   # confirmed yaw=0
+            'top':    (  0,  89),
+            'bottom': (  0, -89),
+        }
+        if preset in presets:
+            self.camera.yaw, self.camera.pitch = presets[preset]
+            self._redraw()
         self.makeCurrent()
         self._free_gpu_meshes()
         self.doneCurrent()
-        self.update()
+        self._redraw()
 
     def set_wireframe(self, enabled: bool):
         self._wireframe = enabled
-        self.update()
+        self._redraw()
 
     # ── OpenGL Lifecycle ──────────────────────────────────────────────────────
 
@@ -285,12 +358,10 @@ class Viewport3D(QOpenGLWidget):
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
-        # Mesh shader
         vert = compileShader(VERT_SRC, GL_VERTEX_SHADER)
         frag = compileShader(FRAG_SRC, GL_FRAGMENT_SHADER)
         self._shader_prog = compileProgram(vert, frag)
 
-        # Grid shader
         gv = compileShader(GRID_VERT, GL_VERTEX_SHADER)
         gf = compileShader(GRID_FRAG, GL_FRAGMENT_SHADER)
         self._grid_prog = compileProgram(gv, gf)
@@ -303,6 +374,10 @@ class Viewport3D(QOpenGLWidget):
     def paintGL(self):
         if not _HAS_OPENGL:
             return
+
+        # Upload any pending model now that GL context is active
+        if self._pending_model is not None:
+            self._upload_pending_model()
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
@@ -367,7 +442,16 @@ class Viewport3D(QOpenGLWidget):
         else:
             self.camera.pan(dx, dy)
         self._last_pos = e.pos()
-        self.update()
+        self._schedule_redraw()
+        # Show angles in status bar for calibration
+        try:
+            win = self.window()
+            if hasattr(win, '_status_lbl'):
+                win._status_lbl.setText(
+                    f"Camera yaw={self.camera.yaw:.0f}°  pitch={self.camera.pitch:.0f}°"
+                )
+        except Exception:
+            pass
 
     def mouseReleaseEvent(self, e: QMouseEvent):
         self._last_pos = None
@@ -375,7 +459,7 @@ class Viewport3D(QOpenGLWidget):
     def wheelEvent(self, e: QWheelEvent):
         delta = e.angleDelta().y() / 120.0
         self.camera.zoom(-delta)
-        self.update()
+        self._redraw()
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -407,34 +491,35 @@ class Viewport3D(QOpenGLWidget):
 
 def _perspective(fov_deg: float, aspect: float, near: float, far: float) -> np.ndarray:
     f = 1.0 / math.tan(math.radians(fov_deg) / 2.0)
-    m = np.zeros((4, 4), np.float32)
-    m[0, 0] = f / aspect
-    m[1, 1] = f
-    m[2, 2] = (far + near) / (near - far)
-    m[2, 3] = -1.0
-    m[3, 2] = (2 * far * near) / (near - far)
-    return m
+    return np.array([
+        [f/aspect, 0,  0,                        0                       ],
+        [0,        f,  0,                        0                       ],
+        [0,        0,  (far+near)/(near-far),    (2*far*near)/(near-far) ],
+        [0,        0, -1,                        0                       ]
+    ], dtype=np.float32)
 
 def _look_at(eye: np.ndarray, center: np.ndarray, up: np.ndarray) -> np.ndarray:
     f = center - eye;  f /= np.linalg.norm(f)
-    s = np.cross(f, up); s /= np.linalg.norm(s)
-    u = np.cross(s, f)
-    m = np.eye(4, dtype=np.float32)
-    m[0, :3] = s;  m[1, :3] = u;  m[2, :3] = -f
-    m[3, 0] = -np.dot(s, eye)
-    m[3, 1] = -np.dot(u, eye)
-    m[3, 2] =  np.dot(f, eye)
-    return m.T
+    r = np.cross(f, up); r /= np.linalg.norm(r)
+    u = np.cross(r, f)
+    return np.array([
+        [ r[0],  r[1],  r[2], -np.dot(r, eye)],
+        [ u[0],  u[1],  u[2], -np.dot(u, eye)],
+        [-f[0], -f[1], -f[2],  np.dot(f, eye)],
+        [ 0,     0,     0,     1             ]
+    ], dtype=np.float32)
 
 def _set_uniform_mat4(prog, name, mat):
     loc = glGetUniformLocation(prog, name)
     if loc >= 0:
-        glUniformMatrix4fv(loc, 1, GL_FALSE, mat.flatten(order='F'))
+        # OpenGL expects column-major; numpy matrices are row-major.
+        # GL_TRUE means transpose on upload, so pass as-is with GL_TRUE.
+        glUniformMatrix4fv(loc, 1, GL_TRUE, mat.astype(np.float32))
 
 def _set_uniform_mat3(prog, name, mat):
     loc = glGetUniformLocation(prog, name)
     if loc >= 0:
-        glUniformMatrix3fv(loc, 1, GL_FALSE, mat.flatten(order='F'))
+        glUniformMatrix3fv(loc, 1, GL_TRUE, mat.astype(np.float32))
 
 def _set_uniform_3f(prog, name, x, y, z):
     loc = glGetUniformLocation(prog, name)

@@ -5,8 +5,8 @@
 #
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(0, 1, 0, 0),
-    prodvers=(0, 1, 0, 0),
+    filevers=(0, 2, 0, 0),
+    prodvers=(0, 2, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -21,12 +21,12 @@ VSVersionInfo(
         u'040904B0',
         [StringStruct(u'CompanyName',      u'RCRA Community'),
          StringStruct(u'FileDescription',  u'RCRA Forge - Rift Apart Level Editor & Asset Exporter'),
-         StringStruct(u'FileVersion',      u'0.1.0.0'),
+         StringStruct(u'FileVersion',      u'0.2.0.0'),
          StringStruct(u'InternalName',     u'RCRA_Forge'),
          StringStruct(u'LegalCopyright',   u'Open Source - Community Project'),
          StringStruct(u'OriginalFilename', u'RCRA_Forge.exe'),
          StringStruct(u'ProductName',      u'RCRA Forge'),
-         StringStruct(u'ProductVersion',   u'0.1.0'),
+         StringStruct(u'ProductVersion',   u'0.2.0'),
          StringStruct(u'Comments',         u'Ratchet & Clank: Rift Apart PC asset browser and model exporter')])
       ]),
     VarFileInfo([VarStruct(u'Translation', [0x0409, 1200])])

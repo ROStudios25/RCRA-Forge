@@ -25,9 +25,10 @@ from core.archive import TocParser, AssetEntry, ASSET_TYPE_NAMES
 # ── Background loader ──────────────────────────────────────────────────────────
 
 class TocLoader(QObject):
-    finished = pyqtSignal(object, object, str, list)  # (parser, entries, timing, groups)
-    progress = pyqtSignal(str)
-    error    = pyqtSignal(str)
+    finished      = pyqtSignal(object, object, str, list)  # parser, entries, timing, groups
+    hashes_ready  = pyqtSignal(object)                     # lookup (after background load)
+    progress      = pyqtSignal(str)
+    error         = pyqtSignal(str)
 
     def __init__(self, path: str):
         super().__init__()
@@ -35,6 +36,7 @@ class TocLoader(QObject):
 
     def run(self):
         import time, struct, zlib
+        print(f"[TocLoader] run() started, path={self.path}")
         try:
             t0 = time.time()
 
@@ -47,12 +49,14 @@ class TocLoader(QObject):
             from core.archive import TOC_MAGIC_RCRA, TOC_MAGIC_MSMR, DAT1, TocParser
             magic, size = struct.unpack_from('<II', raw, 0)
             if magic == TOC_MAGIC_RCRA:
-                dat1_data = raw[8:8 + size]
+                # Use memoryview — zero copy slice of the 12MB buffer
+                dat1_data = memoryview(raw)[8:8 + size]
             elif magic == TOC_MAGIC_MSMR:
                 dat1_data = zlib.decompress(raw[8:])
             else:
                 raise ValueError(f"Unknown TOC magic {magic:#010x}")
-            dat1 = DAT1(dat1_data)
+            dat1 = DAT1(bytes(dat1_data))  # DAT1 needs bytes for struct.unpack_from
+            del raw  # free the 12MB buffer immediately after slicing
             t2 = time.time()
 
             self.progress.emit("Building asset index…")
@@ -62,18 +66,37 @@ class TocLoader(QObject):
             t3 = time.time()
 
             self.progress.emit("Grouping assets by archive…")
-            # Pre-compute groups on background thread so main thread just adds tree items
             import numpy as np
-            arc_col  = entries._sizes['archive'][:len(entries)].astype(np.int32)
-            sort_idx = np.argsort(arc_col, kind='stable')
+            print("[TocLoader] grouping...")
+            entries     = parser.entries
+            arc_col     = entries._sizes['archive'][:len(entries)].astype(np.int32)
+            sort_idx    = np.argsort(arc_col, kind='stable')
             sorted_arcs = arc_col[sort_idx]
             boundaries  = np.where(np.diff(sorted_arcs))[0] + 1
             starts = np.concatenate([[0], boundaries])
             ends   = np.concatenate([boundaries, [len(sort_idx)]])
             groups = [
-                (int(sorted_arcs[s]), sort_idx[s:e].tolist())
-                for s, e in zip(starts, ends)
+                (int(sorted_arcs[s]), sort_idx[s:e])
+                for s, e in zip(starts.tolist(), ends.tolist())
             ]
+            print(f"[TocLoader] grouped into {len(groups)} archives")
+
+            # Load hashes.txt asynchronously
+            self.progress.emit("TOC ready — loading asset names in background…")
+            from core.hashes import get_lookup, try_load_from_game_root
+            lookup = get_lookup()
+            game_root = os.path.dirname(self.path)
+            print(f"[TocLoader] starting hashes thread, game_root={game_root}")
+
+            import threading
+            def _load_hashes():
+                print("[hashes thread] starting...")
+                try_load_from_game_root(game_root)
+                print(f"[hashes thread] done, {len(lookup)} entries")
+                self.hashes_ready.emit(lookup)
+
+            t = threading.Thread(target=_load_hashes, daemon=True)
+            t.start()
 
             timing = (
                 f"disk:{t1-t0:.2f}s  "
@@ -81,7 +104,8 @@ class TocLoader(QObject):
                 f"index:{t3-t2:.2f}s  "
                 f"total:{time.time()-t0:.2f}s"
             )
-            self.progress.emit(f"Done — {len(entries):,} assets found")
+            print(f"[TocLoader] emitting finished signal, {len(entries):,} entries")
+            self.progress.emit(f"Done — {len(entries):,} assets  (names loading…)")
             self.finished.emit(parser, entries, timing, groups)
         except Exception as ex:
             import traceback
@@ -103,21 +127,33 @@ class AssetLoader(QObject):
         self.toc_parser = toc_parser
 
     def run(self):
+        import time
+        t0 = time.perf_counter()
         try:
+            print(f"[AssetLoader] extracting {self.entry.asset_id:#018x} "
+                  f"size={self.entry.size:,} archive={self.entry.archive}")
             data = self.toc_parser.extract_asset(self.entry)
+            print(f"[AssetLoader] extracted {len(data):,} bytes in {time.perf_counter()-t0:.3f}s")
+
             self.raw_ready.emit(data, f'asset_{self.entry.asset_id:#018x}')
 
             from core.archive import DAT1, ASSET_TYPE_NAMES
             dat1 = DAT1(data)
             atype = ASSET_TYPE_NAMES.get(dat1.unk1, '')
+            print(f"[AssetLoader] DAT1 type={atype} unk1={dat1.unk1:#010x} "
+                  f"sections={len(dat1.sections)}")
 
             if atype == 'model':
+                print("[AssetLoader] parsing model...")
                 from core.mesh import ModelParser
                 from core.skeleton import Skeleton
                 model = ModelParser(data).parse()
+                print(f"[AssetLoader] model parsed: {len(model.vertexes)} verts, "
+                      f"{len(model.meshes)} meshes, {len(model.indexes)} indices")
                 self.mesh_ready.emit(model)
                 skel = Skeleton.from_model(model)
                 if skel and skel.bones:
+                    print(f"[AssetLoader] skeleton: {len(skel.bones)} bones")
                     self.skel_ready.emit(skel)
 
             elif atype == 'texture':
@@ -147,9 +183,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("RCRA Forge — Ratchet & Clank: Rift Apart Editor")
         self.resize(1440, 900)
-        self._load_thread: QThread  = None
-        self._asset_thread: QThread = None
-        self._toc_parser: TocParser = None
+        self._load_thread:   QThread    = None
+        self._asset_thread:  QThread    = None
+        self._toc_parser:    TocParser  = None
+        self._loader        = None   # keeps TocLoader alive during thread run
+        self._asset_loader  = None   # keeps AssetLoader alive during thread run
         self._setup_ui()
         self._setup_menus()
         self._setup_toolbar()
@@ -259,6 +297,10 @@ class MainWindow(QMainWindow):
         act_toc.triggered.connect(self._open_toc_file)
         file_m.addAction(act_toc)
 
+        act_hashes = QAction("Load hashes.txt…", self)
+        act_hashes.triggered.connect(self._load_hashes_file)
+        file_m.addAction(act_hashes)
+
         file_m.addSeparator()
         act_quit = QAction("Quit", self)
         act_quit.setShortcut(QKeySequence.StandardKey.Quit)
@@ -304,6 +346,17 @@ class MainWindow(QMainWindow):
         act_frame_tb = QAction("⊞ Frame", self)
         act_frame_tb.triggered.connect(self._frame_scene)
         tb.addAction(act_frame_tb)
+
+        # View preset dropdown
+        from PyQt6.QtWidgets import QComboBox
+        self._view_preset = QComboBox()
+        self._view_preset.setObjectName("ViewPreset")
+        self._view_preset.setFixedWidth(72)
+        self._view_preset.addItems(["Main", "Front", "Back", "Right", "Left", "Top", "Bottom"])
+        self._view_preset.activated.connect(
+            lambda _: self._viewport.set_view_preset(self._view_preset.currentText().lower())
+        )
+        tb.addWidget(self._view_preset)
 
         tb.addSeparator()
 
@@ -579,33 +632,37 @@ class MainWindow(QMainWindow):
     # ── Actions ───────────────────────────────────────────────────────────────
 
     def _open_game_folder(self):
-        # Try to find a sensible default directory across common Steam locations
-        import os
-        candidates = [
-            r"C:\Program Files (x86)\Steam\steamapps\common",
-            r"C:\Program Files\Steam\steamapps\common",
-            r"D:\Steam\steamapps\common",
-            r"D:\SteamLibrary\steamapps\common",
-            r"E:\Steam\steamapps\common",
-            r"E:\SteamLibrary\steamapps\common",
-        ]
-        # Also check Steam's libraryfolders.vdf for configured libraries
-        vdf_paths = [
-            r"C:\Program Files (x86)\Steam\steamapps\libraryfolders.vdf",
-            r"C:\Program Files\Steam\steamapps\libraryfolders.vdf",
-        ]
-        for vdf in vdf_paths:
-            if os.path.exists(vdf):
-                try:
-                    with open(vdf, 'r', encoding='utf-8', errors='ignore') as f:
-                        for line in f:
-                            if '"path"' in line.lower():
-                                path = line.split('"')[-2].replace('\\\\', '\\')
-                                candidates.append(os.path.join(path, 'steamapps', 'common'))
-                except Exception:
-                    pass
+        import string, ctypes
 
-        default_dir = next((c for c in candidates if os.path.exists(c)), "")
+        # Get all available drive letters on Windows
+        drives = []
+        try:
+            bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+            for letter in string.ascii_uppercase:
+                if bitmask & 1:
+                    drives.append(letter)
+                bitmask >>= 1
+        except Exception:
+            drives = list('CDEFGHIJKLMNOPQRSTUVWXYZ')
+
+        # Search all drives for Steam install
+        steam_subpaths = [
+            r"Steam\steamapps\common\Ratchet & Clank - Rift Apart",
+            r"SteamLibrary\steamapps\common\Ratchet & Clank - Rift Apart",
+            r"Games\Steam\steamapps\common\Ratchet & Clank - Rift Apart",
+            r"Program Files (x86)\Steam\steamapps\common\Ratchet & Clank - Rift Apart",
+            r"Program Files\Steam\steamapps\common\Ratchet & Clank - Rift Apart",
+        ]
+
+        default_dir = ""
+        for drive in drives:
+            for sub in steam_subpaths:
+                candidate = f"{drive}:\\{sub}"
+                if os.path.exists(candidate):
+                    default_dir = candidate
+                    break
+            if default_dir:
+                break
 
         folder = QFileDialog.getExistingDirectory(
             self, "Select Rift Apart Game Folder", default_dir
@@ -628,6 +685,21 @@ class MainWindow(QMainWindow):
         self._load_toc(toc_path)
         self._game_path_lbl.setText(f"  {os.path.basename(folder)}  ")
 
+    def _load_hashes_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load hashes.txt", "",
+            "Hash files (hashes.txt);;Text Files (*.txt);;All Files (*.*)"
+        )
+        if not path:
+            return
+        from core.hashes import get_lookup
+        lookup = get_lookup()
+        count = lookup.load(path)
+        self._status_lbl.setText(f"Loaded {count:,} asset names from hashes.txt")
+        # Refresh the browser with new names if TOC is already loaded
+        if self._toc_parser:
+            self._browser.set_lookup(lookup)
+
     def _open_toc_file(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Open TOC File", "", "TOC Files (toc);;All Files (*.*)"
@@ -646,27 +718,41 @@ class MainWindow(QMainWindow):
         self._browser.clear()
 
         self._load_thread = QThread(self)
-        loader = TocLoader(path)
-        loader.moveToThread(self._load_thread)
-        self._load_thread.started.connect(loader.run)
-        loader.progress.connect(self._status_lbl.setText)
-        loader.finished.connect(self._on_toc_loaded)
-        loader.error.connect(self._on_load_error)
-        loader.finished.connect(self._load_thread.quit)
-        loader.error.connect(self._load_thread.quit)
+        self._loader = TocLoader(path)          # keep reference on self!
+        self._loader.moveToThread(self._load_thread)
+        self._load_thread.started.connect(self._loader.run)
+        self._loader.progress.connect(self._status_lbl.setText)
+        self._loader.finished.connect(self._on_toc_loaded)
+        self._loader.hashes_ready.connect(self._on_hashes_ready)
+        self._loader.error.connect(self._on_load_error)
+        self._loader.finished.connect(self._load_thread.quit)
+        self._loader.error.connect(self._load_thread.quit)
         self._load_thread.start()
+        print(f"[_load_toc] thread started for {path}")
 
     def _on_toc_loaded(self, parser, entries, timing, groups):
         import time
-        elapsed = time.time() - getattr(self, '_toc_load_start', 0)
+        t0 = time.perf_counter()
+        elapsed_wall = time.time() - getattr(self, '_toc_load_start', 0)
         self._toc_parser = parser
         self._progress.setVisible(False)
-        self._browser.load_entries_grouped(entries, groups)
+        t1 = time.perf_counter()
+        self._browser.load_entries_grouped(entries, groups, None)
+        t2 = time.perf_counter()
+        print(f"[main] progress_hide:{t1-t0:.3f}s  load_browser:{t2-t1:.3f}s  "
+              f"wall:{elapsed_wall:.2f}s")
         self._status_lbl.setText(
             f"Loaded {len(entries):,} assets  ·  "
             f"{len(parser.archives)} archives  ·  "
-            f"wall:{elapsed:.1f}s  [{timing}]"
+            f"wall:{elapsed_wall:.1f}s  [{timing}]  — names loading…"
         )
+
+    def _on_hashes_ready(self, lookup):
+        """Called when hashes.txt finishes loading in background."""
+        self._browser.set_lookup(lookup)
+        n = len(lookup) if lookup and lookup.is_loaded() else 0
+        current = self._status_lbl.text().replace("— asset names loading…", "")
+        self._status_lbl.setText(f"{current.strip()}  ·  {n:,} names")
 
     def _on_load_error(self, msg: str):
         self._progress.setVisible(False)
@@ -674,24 +760,27 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Load Error", msg)
 
     def _on_asset_activated(self, entry):
+        if self._toc_parser is None:
+            self._status_lbl.setText("No TOC loaded — open a game folder first")
+            return
         self._props.set_entry(entry)
         self._status_lbl.setText(f"Loading asset {entry.asset_id:#018x}…")
 
         self._asset_thread = QThread(self)
-        loader = AssetLoader(entry)
-        loader.moveToThread(self._asset_thread)
-        self._asset_thread.started.connect(loader.run)
+        self._asset_loader = AssetLoader(entry, self._toc_parser)  # keep reference!
+        self._asset_loader.moveToThread(self._asset_thread)
+        self._asset_thread.started.connect(self._asset_loader.run)
 
-        loader.mesh_ready.connect(self._on_mesh_ready)
-        loader.texture_ready.connect(self._on_texture_ready)
-        loader.skel_ready.connect(self._on_skel_ready)
-        loader.level_ready.connect(self._on_level_ready)
-        loader.raw_ready.connect(self._on_raw_ready)
-        loader.error.connect(self._on_asset_error)
+        self._asset_loader.mesh_ready.connect(self._on_mesh_ready)
+        self._asset_loader.texture_ready.connect(self._on_texture_ready)
+        self._asset_loader.skel_ready.connect(self._on_skel_ready)
+        self._asset_loader.level_ready.connect(self._on_level_ready)
+        self._asset_loader.raw_ready.connect(self._on_raw_ready)
+        self._asset_loader.error.connect(self._on_asset_error)
 
-        # Quit thread on any terminal signal
-        for sig in (loader.mesh_ready, loader.texture_ready,
-                    loader.skel_ready, loader.level_ready, loader.error):
+        for sig in (self._asset_loader.mesh_ready, self._asset_loader.texture_ready,
+                    self._asset_loader.skel_ready, self._asset_loader.level_ready,
+                    self._asset_loader.error):
             sig.connect(self._asset_thread.quit)
 
         self._asset_thread.start()
@@ -754,12 +843,11 @@ class MainWindow(QMainWindow):
         self._act_wire_tb.setChecked(checked)
 
     def _frame_scene(self):
-        self._viewport.camera.dist = self._viewport.camera.dist  # trigger repaint
-        self._viewport.update()
+        self._viewport.frame_model()
 
     def _show_about(self):
         QMessageBox.about(self, "About RCRA Forge",
-            "<h3>RCRA Forge v0.1.0</h3>"
+            "<h3>RCRA Forge v0.2.0</h3>"
             "<p>Ratchet &amp; Clank: Rift Apart level editor and model exporter.</p>"
             "<p>Format reverse engineering credit:<br>"
             "&nbsp;• chaoticgd / <i>ripped_apart</i> (MIT)<br>"

@@ -61,7 +61,9 @@ TAG_TEXTURES      = 0x36A6C8CC   # texture asset ID list
 
 # ── Asset type identifiers (unk1 field in DAT1 header) ────────────────────────
 ASSET_TYPE_NAMES = {
-    0x98906B9F: 'model',
+    0x98906B9F: 'model',       # MSMR/Spider-Man
+    0xDB40514C: 'model',       # MM/Miles Morales
+    0x9D2C0FA9: 'model',       # RCRA/Rift Apart ← ModelRcra
     0x5C4580B9: 'texture',
     0x8A0B1487: 'zone',
     0x2AFE7495: 'level',
@@ -77,6 +79,9 @@ ASSET_TYPE_NAMES = {
     0x35C9D886: 'wwiselookup',
     0x567CC2F0: 'levellight',
     0x51B8E006: 'toc',
+    0xC4999B32: 'cinematic2',
+    0x23A93984: 'conduit',
+    0x2A077A51: 'dag',
 }
 
 
@@ -135,18 +140,34 @@ class DAT1:
         d = self._view
         if len(d) < 16:
             return
-        magic, self.unk1, total_size = struct.unpack_from('<III', d, 0)
+
+        # Try offset 0 first (standard case)
+        magic = struct.unpack_from('<I', d, 0)[0]
+
+        # If not found at 0, scan the first 256 bytes for DAT1 magic
+        # This handles assets with a prepended header blob
+        offset = 0
+        if magic != DAT1_MAGIC:
+            for off in range(0, min(256, len(d) - 4), 4):
+                if struct.unpack_from('<I', d, off)[0] == DAT1_MAGIC:
+                    offset = off
+                    magic = DAT1_MAGIC
+                    break
+
         if magic != DAT1_MAGIC:
             return
+
+        d = d[offset:]   # slice to start of DAT1
+        self.unk1 = struct.unpack_from('<I', d, 4)[0]
+        total_size = struct.unpack_from('<I', d, 8)[0]
         section_count, unknown_count = struct.unpack_from('<HH', d, 12)
         for i in range(section_count):
             base = 16 + i * 12
             if base + 12 > len(d):
                 break
-            tag, offset, size = struct.unpack_from('<III', d, base)
-            if offset + size <= len(d):
-                # memoryview slice — zero copy, no allocation
-                self.sections[tag] = d[offset:offset + size]
+            tag, sec_offset, size = struct.unpack_from('<III', d, base)
+            if sec_offset + size <= len(d):
+                self.sections[tag] = d[sec_offset:sec_offset + size]
 
     def get_section(self, tag: int) -> Optional[memoryview]:
         return self.sections.get(tag)
@@ -188,11 +209,12 @@ class _LazyEntryList:
         row   = self._sizes[idx]
         h_off = int(row['hdr_off'])
         hdr   = None
-        if h_off != -1 and self._hdr_data:
+        if h_off != -1 and self._hdr_data is not None:
             start = h_off
             end   = start + 36
             if end <= len(self._hdr_data):
-                hdr = self._hdr_data[start:end]   # single slice, no pre-built list
+                # Convert memoryview slice to bytes only when actually needed
+                hdr = bytes(self._hdr_data[start:end])
         entry = AssetEntry(
             index    = idx,
             asset_id = int(self._ids[idx]),
@@ -257,7 +279,7 @@ class TocParser:
 
         RCRA_ARC_SIZE = 66
         for i in range(len(arc_data) // RCRA_ARC_SIZE):
-            raw = arc_data[i * RCRA_ARC_SIZE:(i + 1) * RCRA_ARC_SIZE]
+            raw = bytes(arc_data[i * RCRA_ARC_SIZE:(i + 1) * RCRA_ARC_SIZE])
             fn  = raw[:40]
             null = fn.find(b'\x00')
             if null >= 0:
@@ -282,10 +304,11 @@ class TocParser:
             ('hdr_off', '<i4'),
         ]))
 
-        # ── Optional asset header blobs — keep as raw buffer, slice on demand ──
+        # ── Optional asset header blobs — zero-copy memoryview ───────────────
         hdrs_data = dat1.get_section(TAG_ASSET_HEADERS)
-        self._header_data: bytes = bytes(hdrs_data) if hdrs_data else b''
-        self._header_count = len(self._header_data) // 36
+        # Keep as memoryview — no copy. numpy can read directly from it.
+        self._header_data = hdrs_data   # memoryview or None
+        self._header_count = (len(hdrs_data) // 36) if hdrs_data else 0
 
         # ── Build lightweight entry list ──────────────────────────────────────
         count = min(len(self._asset_ids_arr), len(self._sizes_arr))
@@ -335,12 +358,14 @@ class TocParser:
             a_off = entry.offset
             a_end = a_off + entry.size
             started = False
+            comp_types_seen = set()
 
             for (real_off, comp_off, real_sz, comp_sz, ctype) in blocks:
                 real_end = real_off + real_sz
                 if real_off <= a_off < real_end:
                     started = True
                 if started:
+                    comp_types_seen.add(ctype)
                     f.seek(comp_off)
                     cdata = f.read(comp_sz)
                     block = _decompress_block(cdata, real_sz, ctype)
@@ -350,6 +375,8 @@ class TocParser:
                 if real_off < a_end <= real_end:
                     break
 
+            print(f"[extract_asset] comp_types used: {comp_types_seen}, "
+                  f"extracted {len(data):,} bytes")
             return bytes(data)
 
     def get_archive_path(self, entry: AssetEntry) -> str:
@@ -361,15 +388,17 @@ class TocParser:
 
 def _decompress_block(data: bytes, real_size: int, comp_type: int) -> bytearray:
     if comp_type == 0:
-        return bytearray(real_size)
+        # Uncompressed — data IS the block, just return it
+        return bytearray(data[:real_size])
     elif comp_type == 2:
         try:
             from dat1lib import gdeflate
             return bytearray(gdeflate.decompress(data, real_size))
         except ImportError:
             raise RuntimeError(
-                "GDeflate block found but 'gdeflate' module unavailable. "
-                "See https://github.com/nicowillis/gdeflate-python"
+                "GDeflate compressed block found but 'gdeflate' module is not available.\n"
+                "This asset is in a GDeflate-compressed archive.\n"
+                "Install gdeflate: pip install gdeflate"
             )
     elif comp_type == 3:
         return bytearray(_insomniac_decompress(data, real_size))
