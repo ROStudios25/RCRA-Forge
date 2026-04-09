@@ -45,6 +45,74 @@ class ExportWorker(QObject):
             self.error.emit(f"{ex}\n{traceback.format_exc()}")
 
 
+class GroupExportWorker(QObject):
+    """
+    Load every asset in a group, then combine them into one GLB.
+    Runs on a background thread — emits progress per part.
+    """
+    progress = pyqtSignal(str)    # status message
+    finished = pyqtSignal(str)    # output path on success
+    error    = pyqtSignal(str)    # error message
+
+    def __init__(self, group, archive_path: str, path: str):
+        """
+        Parameters
+        ----------
+        group        : AssetGroup  (from core.grouping)
+        archive_path : str         path to the game 'toc' file (to open WADs)
+        path         : str         output .glb path
+        """
+        super().__init__()
+        self.group        = group
+        self.archive_path = archive_path
+        self.path         = path
+
+    def run(self):
+        try:
+            from exporters.group_exporter import GroupExporter
+            from core.mesh import parse_model_asset
+            from core.archive import TocParser
+
+            exporter = GroupExporter(slug=self.group.slug.rsplit('/', 1)[-1])
+            n = len(self.group.entries)
+
+            for i, entry in enumerate(self.group.entries):
+                part_name = self.group.entries[i]
+                # Derive part name from the asset id / path
+                # We'll use a simple index-based name if lookup not available
+                try:
+                    from core.hashes import get_lookup
+                    lk = get_lookup()
+                    if lk and lk.is_loaded():
+                        full = lk.full_path(entry.asset_id)
+                        part_name = full.rsplit('/', 1)[-1].rsplit('.', 1)[0]
+                    else:
+                        part_name = f"part_{i:03d}"
+                except Exception:
+                    part_name = f"part_{i:03d}"
+
+                self.progress.emit(f"Loading part {i+1}/{n}: {part_name}…")
+
+                try:
+                    # Read raw bytes from the WAD archive
+                    parser = TocParser(self.archive_path)
+                    raw = parser.read_asset(entry)
+                    model = parse_model_asset(raw, entry.header)
+                    exporter.add_model(model, part_name)
+                except Exception as ex:
+                    self.progress.emit(f"  ⚠ Skipped {part_name}: {ex}")
+                    continue
+
+            self.progress.emit(f"Writing GLB ({n} parts)…")
+            exporter.export_glb(self.path)
+            self.finished.emit(self.path)
+
+        except Exception as ex:
+            import traceback
+            self.error.emit(f"{ex}\n{traceback.format_exc()}")
+
+
+
 class PropertiesPanel(QWidget):
     request_export = pyqtSignal(str, str)   # (output_path, format_string)
 
@@ -52,6 +120,8 @@ class PropertiesPanel(QWidget):
         super().__init__(parent)
         self._entry:      AssetEntry  = None
         self._mesh_asset             = None
+        self._group                  = None   # AssetGroup for batch export
+        self._archive_path: str      = None   # path to game 'toc' file
         self._export_thread: QThread = None
         self._build_ui()
 
@@ -142,6 +212,28 @@ class PropertiesPanel(QWidget):
         self._btn_export.clicked.connect(self._do_export)
         elayout.addWidget(self._btn_export)
 
+        # ── Group export ─────────────────────────────────────────────────────
+        from PyQt6.QtWidgets import QFrame as _QFrame
+        sep = _QFrame()
+        sep.setFrameShape(_QFrame.Shape.HLine)
+        sep.setFrameShadow(_QFrame.Shadow.Sunken)
+        elayout.addWidget(sep)
+
+        self._group_info = QLabel("No group selected")
+        self._group_info.setObjectName("FieldValue")
+        self._group_info.setWordWrap(True)
+        elayout.addWidget(self._group_info)
+
+        self._btn_export_group = QPushButton("⬡  Export Group as GLB")
+        self._btn_export_group.setObjectName("ExportBtn")
+        self._btn_export_group.setEnabled(False)
+        self._btn_export_group.setToolTip(
+            "Export all parts of the selected group into a single GLB.\n"
+            "Each part becomes a separate named mesh node in Blender."
+        )
+        self._btn_export_group.clicked.connect(self._do_export_group)
+        elayout.addWidget(self._btn_export_group)
+
         # Progress
         self._progress = QProgressBar()
         self._progress.setRange(0, 0)   # indeterminate
@@ -201,10 +293,63 @@ class PropertiesPanel(QWidget):
         self._mesh_group.setVisible(True)
         self._btn_export.setEnabled(True)
 
+    def set_archive_path(self, path: str):
+        """Store the loaded toc path so group export can open WADs."""
+        self._archive_path = path
+
+    def set_group(self, group):
+        """Populate the group export section with *group* info."""
+        self._group = group
+        name = group.slug.rsplit('/', 1)[-1]
+        self._group_info.setText(
+            f"<b>{name}</b><br>"
+            f"<span style='color:#95a5a6'>{group.count} parts · {group.directory or 'root'}</span>"
+        )
+        self._group_info.setTextFormat(Qt.TextFormat.RichText)
+        self._btn_export_group.setEnabled(True)
+        self._btn_export_group.setText(f"⬡  Export Group  ({group.count} parts)")
+
     def log(self, msg: str):
         self._log.append(msg)
 
     # ── Private ───────────────────────────────────────────────────────────────
+
+    def _do_export_group(self):
+        if not self._group:
+            return
+        if not self._archive_path:
+            self._export_status.setText("✗ No archive loaded — open a game folder first")
+            return
+
+        name = self._group.slug.rsplit('/', 1)[-1]
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Group as GLB", name + ".glb", "GLB Files (*.glb);;All Files (*.*)"
+        )
+        if not path:
+            return
+
+        self._btn_export_group.setEnabled(False)
+        self._btn_export.setEnabled(False)
+        self._progress.setVisible(True)
+        self._export_status.setText("Starting group export…")
+
+        self._export_thread = QThread(self)
+        worker = GroupExportWorker(self._group, self._archive_path, path)
+        worker.moveToThread(self._export_thread)
+        self._export_thread.started.connect(worker.run)
+        worker.progress.connect(self._export_status.setText)
+        worker.finished.connect(self._on_group_export_done)
+        worker.error.connect(self._on_export_error)
+        worker.finished.connect(self._export_thread.quit)
+        worker.error.connect(self._export_thread.quit)
+        self._export_thread.start()
+
+    def _on_group_export_done(self, path: str):
+        self._progress.setVisible(False)
+        self._btn_export_group.setEnabled(True)
+        self._btn_export.setEnabled(self._mesh_asset is not None)
+        self._export_status.setText(f"✓ Group exported → {os.path.basename(path)}")
+        self.log(f"[GROUP OK] {path}")
 
     def _do_export(self):
         if self._mesh_asset is None:

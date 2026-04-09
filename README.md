@@ -1,6 +1,6 @@
 # RCRA Forge
 
-**Ratchet & Clank: Rift Apart — Level Editor & Asset Exporter (PC)** — v0.2.0
+**Ratchet & Clank: Rift Apart — Level Editor & Asset Exporter (PC)** — v0.3.0
 
 A Python/PyQt6 desktop application for browsing, previewing, and exporting assets from the PC version of Ratchet & Clank: Rift Apart — without needing Ninja Ripper.
 
@@ -13,12 +13,28 @@ A Python/PyQt6 desktop application for browsing, previewing, and exporting asset
 | Panel | Description |
 |---|---|
 | **Asset Browser** | Parses the game's `toc` file in ~0.03s, lists all 340,661 assets with real names from `hashes.txt` |
+| **Groups** | Auto-detects related assets by name prefix — enemy parts, chunk meshes, LODs all collapse into expandable groups |
+| **Smart Search** | Multi-word AND search (`enm chunk`), runs on a background thread, auto-groups results by file type |
 | **3D Viewport** | PyOpenGL viewer — right-drag orbit, middle-drag pan, scroll zoom, wireframe toggle, view presets |
 | **Texture Viewer** | Decodes BCn/DDS textures, exports `.dds` |
 | **Scene Panel** | Shows DAT1 section info for level/zone assets |
 | **Skeleton Viewer** | Bone hierarchy tree with 2D rest-pose projection |
 | **Hex Inspector** | Raw DAT1 byte viewer with jump-to-offset |
 | **Export** | One-click export to `.glb`, `.gltf`, or `.obj` for Blender |
+| **Group Export** | Export all parts of a character/object as a single `.glb` with named mesh nodes |
+
+---
+
+## What's New in v0.3.0
+
+- ✅ **Group export** — batch export all parts of an enemy/character as one GLB with named mesh nodes, opens cleanly in Blender's outliner
+- ✅ **Groups toggle** — amber group rows in the asset browser, assets auto-grouped by shared name prefix (`_chunk_NN`, `_lod`, `_damaged`, `_body`, etc.)
+- ✅ **Smart search grouping** — results auto-group by slug when a file format filter is active
+- ✅ **Multi-token AND search** — `enm chunk` or `enm_chunk` finds assets containing both words
+- ✅ **Debounced background search** — 200ms debounce + QThread worker, no UI freezing while typing
+- ✅ **Groups toggle respects search** — toggling on/off keeps active search results
+- ✅ **Freely resizable panels** — drag any splitter as wide as needed to read long asset names
+- ✅ **Wider splitter handles** — 4px with hover/pressed highlight for easier grabbing
 
 ---
 
@@ -31,18 +47,16 @@ A Python/PyQt6 desktop application for browsing, previewing, and exporting asset
 - ✅ **Frame button** — resets camera to fit loaded model
 - ✅ **Asset name lookup** — `hashes.txt` integration shows real filenames (384,260 entries)
 - ✅ **TOC loads instantly** — ~0.03 seconds for 340,661 assets
-- ✅ **Fixed ModelRcra** — correct magic `0x9D2C0FA9` for Rift Apart models
-- ✅ **Fixed DAT1 parsing** — handles header blob offset correctly
 
 ---
 
 ## Known Issues
 
-### 🐛 Grid not visible in viewport
-The floor grid renders but may not be visible depending on scene scale.
+### 🐛 Textures show as flat colors
+Rift Apart texture pixel data is split across the DAT1 asset and a separate HD archive. The HD pixel data read is not yet fully implemented — models render with flat shading only.
 
-### 🐛 Textures show as blank
-Rift Apart texture pixel data is split across the DAT1 asset and a separate HD archive. The HD pixel data read is not yet fully implemented.
+### 🐛 Group export geometry
+The group export GLB structure is correct but mesh geometry accuracy depends on the vertex format parsing in `core/mesh.py`. Verify results in Blender and report any issues.
 
 ### 🐛 GDeflate decompression unavailable
 Assets in GDeflate-compressed archives (`comp_type=2`) cannot be extracted until the `gdeflate` Python module is available.
@@ -51,10 +65,10 @@ Assets in GDeflate-compressed archives (`comp_type=2`) cannot be extracted until
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.8+
 - PyQt6, PyOpenGL, NumPy (see `requirements.txt`)
 - **Ratchet & Clank: Rift Apart** (Steam PC)
-- **`hashes.txt`** from [Overstrike/Overdrive](https://github.com/Tkachov/overstrike) — **required** for asset names. Without it, all assets show as raw hex IDs. Place it in the same folder as the game's `toc` file or next to the RCRA Forge executable.
+- **`hashes.txt`** from [Overstrike/Overdrive](https://github.com/Tkachov/overstrike) — **required** for asset names and grouping. Without it, all assets show as raw hex IDs and Groups mode is unavailable. Place it in the same folder as the game's `toc` file or next to the RCRA Forge executable.
 
 ---
 
@@ -86,15 +100,31 @@ python demo.py
 
 ## Usage
 
+### Basic browsing
 1. **File → Open Game Folder** → select your Rift Apart Steam install directory
-2. Wait for the TOC to load (~0.03s) — assets appear grouped by archive with real filenames
-3. Use the **search box** to find assets by name (e.g. `zurkon`) or hex ID
-4. Use the **type filter** to narrow by extension (`.model`, `.texture`, `.zone`, etc.)
-5. **Double-click** any asset to load it into the 3D viewer
-6. Use **right-drag** to orbit, **middle-drag** to pan, **scroll** to zoom
-7. Select export format (GLB/GLTF/OBJ) in the Properties panel and click **Export Asset**
+2. Wait for the TOC to load (~0.03s) and names to populate (~1-2s)
+3. **Double-click** any asset to load it into the 3D viewer
+4. Use **right-drag** to orbit, **middle-drag** to pan, **scroll** to zoom
 
-### Known test assets (from [ALERT PR #17](https://github.com/Tkachov/ALERT/pull/17))
+### Searching
+- Type in the search box to filter by name — results appear after a 200ms pause
+- Use **spaces or underscores** to AND multiple terms: `enm chunk` finds assets containing both `enm` and `chunk`
+- Select a file type (`.model`, `.texture`, etc.) from the dropdown to filter by extension
+- When a file type is selected, results automatically group by shared name prefix
+
+### Groups
+- Click the **⬡ Groups** button to switch the browser into grouped view
+- Assets are auto-grouped by shared name prefix — enemy parts, chunk meshes, LOD levels all collapse together
+- **Expand** a group to see all its parts
+- **Double-click** a group header to select it for batch export
+
+### Exporting
+- **Single asset** — double-click an asset, choose format (GLB/GLTF/OBJ), click **Export Asset**
+- **Group export** — double-click a group header, click **⬡ Export Group (N parts)** in the Properties panel
+  - All parts export as one `.glb` with named mesh nodes
+  - In Blender: **File → Import → glTF 2.0** — each part appears as a separate object under a shared root
+
+### Known test assets
 
 | Asset ID | Path |
 |---|---|
@@ -144,9 +174,9 @@ data:   DAT1 container (magic 0x44415431)
 ## Contributing
 
 Contributions welcome, especially for:
-- **TOC load performance** — profiling `core/archive.py`
-- **Vertex format accuracy** — verifying `core/mesh.py`
-- **Texture pixel data** — HD archive texture read
+- **Texture pixel data** — HD archive texture read (`core/texture.py`)
 - **Level/zone parsing** — `core/level.py` stubs need real section parsers
+- **Group export accuracy** — verifying GLB output against known-good models
+- **Vertex format accuracy** — verifying the 16-byte vertex decode in `core/mesh.py`
 
 Please open an issue before a large PR.

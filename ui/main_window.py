@@ -186,6 +186,7 @@ class MainWindow(QMainWindow):
         self._load_thread:   QThread    = None
         self._asset_thread:  QThread    = None
         self._toc_parser:    TocParser  = None
+        self._toc_path:      str        = None   # path to loaded 'toc' file
         self._loader        = None   # keeps TocLoader alive during thread run
         self._asset_loader  = None   # keeps AssetLoader alive during thread run
         self._setup_ui()
@@ -209,9 +210,9 @@ class MainWindow(QMainWindow):
 
         # Left: Asset browser
         self._browser = AssetBrowser()
-        self._browser.setMinimumWidth(220)
-        self._browser.setMaximumWidth(380)
+        self._browser.setMinimumWidth(180)
         self._browser.asset_activated.connect(self._on_asset_activated)
+        self._browser.group_activated.connect(self._on_group_activated)
         outer.addWidget(self._browser)
 
         # ── Right side: vertical split [Viewport top | Tabs bottom] ──────────
@@ -229,16 +230,14 @@ class MainWindow(QMainWindow):
         top_splitter.addWidget(self._viewport)
 
         self._props = PropertiesPanel()
-        self._props.setMinimumWidth(220)
-        self._props.setMaximumWidth(340)
+        self._props.setMinimumWidth(200)
         top_splitter.addWidget(self._props)
         top_splitter.setSizes([900, 280])
 
         # ── Bottom: tabbed panel [Texture | Scene | Skeleton | Hex] ──────────
         self._tab_panel = QTabWidget()
         self._tab_panel.setObjectName("BottomTabs")
-        self._tab_panel.setMinimumHeight(180)
-        self._tab_panel.setMaximumHeight(380)
+        self._tab_panel.setMinimumHeight(120)
         right_splitter.addWidget(self._tab_panel)
 
         right_splitter.setSizes([560, 220])
@@ -402,8 +401,9 @@ class MainWindow(QMainWindow):
         }
         QToolBar QToolButton:hover    { background: #2a2d36; border-color: #3a3d4a; }
         QToolBar QToolButton:checked  { background: #253a5e; border-color: #3a6fbf; color: #5ba3f5; }
-        QSplitter::handle { background: #2a2d36; width: 2px; height: 2px; }
+        QSplitter::handle { background: #2a2d36; width: 4px; height: 4px; }
         QSplitter::handle:hover { background: #3a6fbf; }
+        QSplitter::handle:pressed { background: #5dade2; }
 
         /* Bottom tab panel */
         #BottomTabs {
@@ -529,6 +529,20 @@ class MainWindow(QMainWindow):
         #ExportBtn:pressed { background: #143a7a; }
         #ExportBtn:disabled { background: #1e2028; color: #404550; border-color: #2a2d36; }
         #ExportStatus { color: #80b0e0; font-size: 10px; }
+
+        /* Groups toggle button in asset browser header */
+        #GroupsToggleBtn {
+            background: transparent;
+            border: 1px solid #3a3d4a;
+            border-radius: 4px;
+            padding: 2px 8px;
+            color: #90a0b8;
+            font-size: 10px;
+            font-weight: 500;
+        }
+        #GroupsToggleBtn:hover   { background: #252830; border-color: #f0a500; color: #f0c040; }
+        #GroupsToggleBtn:checked { background: #2a2210; border-color: #f0a500; color: #f0a500; font-weight: 700; }
+        #GroupsToggleBtn:checked:hover { background: #3a2e10; }
         #LogBox {
             background: #13151a;
             border: 1px solid #2a2d36;
@@ -709,6 +723,7 @@ class MainWindow(QMainWindow):
 
     def _load_toc(self, path: str):
         import time
+        self._toc_path = path
         self._toc_load_start = time.time()
         toc_size_mb = os.path.getsize(path) / (1024*1024)
         self._status_lbl.setText(
@@ -736,6 +751,7 @@ class MainWindow(QMainWindow):
         elapsed_wall = time.time() - getattr(self, '_toc_load_start', 0)
         self._toc_parser = parser
         self._progress.setVisible(False)
+        self._props.set_archive_path(self._toc_path)
         t1 = time.perf_counter()
         self._browser.load_entries_grouped(entries, groups, None)
         t2 = time.perf_counter()
@@ -784,6 +800,15 @@ class MainWindow(QMainWindow):
             sig.connect(self._asset_thread.quit)
 
         self._asset_thread.start()
+
+    def _on_group_activated(self, group):
+        """User double-clicked a named group in the Groups tree view."""
+        self._props.set_group(group)
+        name = group.slug.rsplit('/', 1)[-1]
+        self._status_lbl.setText(
+            f"Group selected: {name}  ({group.count} parts) — "
+            f"click 'Export Group as GLB' in Properties to export"
+        )
 
     def _on_mesh_ready(self, model_asset):
         self._viewport.load_mesh(model_asset)
