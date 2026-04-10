@@ -114,17 +114,19 @@ class TocLoader(QObject):
 
 class AssetLoader(QObject):
     """Load + parse a single asset on a background thread."""
-    mesh_ready    = pyqtSignal(object)        # ModelAsset
-    texture_ready = pyqtSignal(object)        # TextureAsset
-    skel_ready    = pyqtSignal(object)        # Skeleton
-    level_ready   = pyqtSignal(object, object)
-    raw_ready     = pyqtSignal(bytes, str)    # raw bytes, label
-    error         = pyqtSignal(str)
+    mesh_ready      = pyqtSignal(object)        # ModelAsset
+    texture_ready   = pyqtSignal(object)        # TextureAsset
+    materials_ready = pyqtSignal(dict)          # {material_index: (rgba_bytes, w, h)}
+    skel_ready      = pyqtSignal(object)        # Skeleton
+    level_ready     = pyqtSignal(object, object)
+    raw_ready       = pyqtSignal(bytes, str)    # raw bytes, label
+    error           = pyqtSignal(str)
 
-    def __init__(self, entry, toc_parser):
+    def __init__(self, entry, toc_parser, lookup=None):
         super().__init__()
         self.entry      = entry
         self.toc_parser = toc_parser
+        self.lookup     = lookup
 
     def run(self):
         import time
@@ -135,7 +137,12 @@ class AssetLoader(QObject):
             data = self.toc_parser.extract_asset(self.entry)
             print(f"[AssetLoader] extracted {len(data):,} bytes in {time.perf_counter()-t0:.3f}s")
 
-            self.raw_ready.emit(data, f'asset_{self.entry.asset_id:#018x}')
+            # Use asset name as label if lookup is available, else hex ID
+            if self.lookup and self.lookup.is_loaded():
+                label = self.lookup.name(self.entry.asset_id)
+            else:
+                label = f'asset_{self.entry.asset_id:#018x}'
+            self.raw_ready.emit(data, label)
 
             from core.archive import DAT1, ASSET_TYPE_NAMES
             dat1 = DAT1(data)
@@ -156,6 +163,9 @@ class AssetLoader(QObject):
                     print(f"[AssetLoader] skeleton: {len(skel.bones)} bones")
                     self.skel_ready.emit(skel)
 
+                # Load materials and decode albedo textures
+                self._load_model_textures(model)
+
             elif atype == 'texture':
                 from core.texture import TextureParser
                 tex = TextureParser(data).parse()
@@ -174,6 +184,118 @@ class AssetLoader(QObject):
         except Exception as ex:
             import traceback
             self.error.emit(f"{ex}\n{traceback.format_exc()}")
+
+    def _load_model_textures(self, model):
+        """
+        For each unique material_index in LOD0 meshes, find the .material asset,
+        parse it, decode the albedo texture, and emit materials_ready.
+        """
+        try:
+            from core.material import parse_material_asset
+            from core.texture import TextureParser
+            from core.hashes import get_lookup
+            import struct
+
+            lookup = self.lookup or get_lookup()
+            if not lookup or not lookup.is_loaded():
+                return
+
+            # Collect unique material indices from LOD0
+            mat_indices = sorted({m.material_index for m in model.meshes if m.lod_level == 0})
+
+            # Read material names from TAG_MATERIALS section (0x3250BB80)
+            from core.archive import DAT1
+            raw = self.toc_parser.extract_asset(self.entry)
+            dat1 = DAT1(raw)
+            TAG_MAT = 0x3250BB80
+            mat_sec = dat1.sections.get(TAG_MAT)
+
+            result = {}
+
+            for mat_idx in mat_indices:
+                try:
+                    mat_name = None
+                    # RCRA TAG_MATERIALS format (confirmed from ALERT unknowns.py):
+                    # Each entry = 16 bytes = (matfile_str_off: u64, matname_str_off: u64)
+                    # matfile_str_off is an absolute offset into the DAT1 string pool
+                    if mat_sec is not None:
+                        sec = bytes(mat_sec)
+                        ENTRY = 16
+                        if mat_idx * ENTRY + ENTRY <= len(sec):
+                            matfile_off, matname_off = struct.unpack_from('<QQ', sec, mat_idx * ENTRY)
+                            mat_name = dat1.get_string(matfile_off)
+
+                    if not mat_name:
+                        continue
+
+                    # Normalize path: backslashes → forward slashes, lowercase
+                    mat_name = mat_name.replace('\\', '/').lower()
+                    if not mat_name.endswith('.material'):
+                        mat_name += '.material'
+
+                    # Find .material asset by path
+                    mat_asset_id = lookup.asset_id(mat_name)
+                    if mat_asset_id is None:
+                        mat_asset_id = lookup.asset_id(mat_name.lstrip('/'))
+                    if mat_asset_id is None:
+                        print(f"[texload] mat[{mat_idx}] path not found: {mat_name}")
+                        continue
+                    mat_entry = self.toc_parser.find_entry(mat_asset_id)
+                    if mat_entry is None:
+                        continue
+
+                    mat_data = self.toc_parser.extract_asset(mat_entry)
+                    mat_asset = parse_material_asset(mat_data)
+                    albedo = mat_asset.albedo_slot
+                    if albedo is None:
+                        # Log all available slots so we can debug
+                        slots = [(s.role, s.name) for s in mat_asset.slots]
+                        print(f"[texload] mat[{mat_idx}] no albedo slot. Available: {slots}")
+                        continue
+
+                    # Find + decode texture — normalize slashes and lowercase
+                    tex_path = albedo.path.replace('\\', '/').lower()
+                    tex_id = lookup.asset_id(tex_path)
+                    if tex_id is None:
+                        tex_id = lookup.asset_id(tex_path.lstrip('/'))
+                    if tex_id is None:
+                        print(f"[texload] mat[{mat_idx}] texture not found: {tex_path}")
+                        continue
+                    tex_entry = self.toc_parser.find_entry(tex_id)
+                    if tex_entry is None:
+                        continue
+                    tex_data = self.toc_parser.extract_asset(tex_entry)
+                    tex = TextureParser(tex_data).parse()
+
+                    # Try to load HD pixel data (separate larger TOC entry, same asset ID)
+                    if tex.hd_len > 0 and tex.hd_width > 0:
+                        all_entries = self.toc_parser.find_all_entries(tex_id)
+                        # HD entry is the largest one (SD is smaller)
+                        hd_candidates = [e for e in all_entries if e.size > tex_entry.size]
+                        if hd_candidates:
+                            hd_entry = max(hd_candidates, key=lambda e: e.size)
+                            try:
+                                hd_raw = self.toc_parser.extract_asset(hd_entry)
+                                # HD pixel data starts at offset 0x00 (no DAT1 header)
+                                tex.hd_pixel_data = bytes(hd_raw)
+                                print(f"[texload] mat[{mat_idx}] HD {tex.hd_width}×{tex.hd_height} loaded ({len(hd_raw):,} bytes)")
+                            except Exception as ex:
+                                print(f"[texload] mat[{mat_idx}] HD load failed: {ex}")
+
+                    rgba = tex.decode_to_rgba()
+                    if rgba:
+                        result[mat_idx] = (rgba, tex.width, tex.height)
+                        print(f"[texload] mat[{mat_idx}] '{mat_name}' albedo {tex.width}×{tex.height}")
+
+                except Exception as ex:
+                    print(f"[texload] mat[{mat_idx}] failed: {ex}")
+
+            if result:
+                self.materials_ready.emit(result)
+
+        except Exception as ex:
+            import traceback
+            print(f"[texload] error: {ex}\n{traceback.format_exc()}")
 
 
 # ── Main Window ───────────────────────────────────────────────────────────────
@@ -233,6 +355,7 @@ class MainWindow(QMainWindow):
         self._props.setMinimumWidth(200)
         top_splitter.addWidget(self._props)
         top_splitter.setSizes([900, 280])
+        self._props.lod_changed.connect(self._viewport.set_lod)
 
         # ── Bottom: tabbed panel [Texture | Scene | Skeleton | Hex] ──────────
         self._tab_panel = QTabWidget()
@@ -783,12 +906,13 @@ class MainWindow(QMainWindow):
         self._status_lbl.setText(f"Loading asset {entry.asset_id:#018x}…")
 
         self._asset_thread = QThread(self)
-        self._asset_loader = AssetLoader(entry, self._toc_parser)  # keep reference!
+        self._asset_loader = AssetLoader(entry, self._toc_parser, self._browser._lookup)  # keep reference!
         self._asset_loader.moveToThread(self._asset_thread)
         self._asset_thread.started.connect(self._asset_loader.run)
 
         self._asset_loader.mesh_ready.connect(self._on_mesh_ready)
         self._asset_loader.texture_ready.connect(self._on_texture_ready)
+        self._asset_loader.materials_ready.connect(self._viewport.load_textures)
         self._asset_loader.skel_ready.connect(self._on_skel_ready)
         self._asset_loader.level_ready.connect(self._on_level_ready)
         self._asset_loader.raw_ready.connect(self._on_raw_ready)

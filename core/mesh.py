@@ -40,14 +40,14 @@ TAG_VERTEXES        = 0xA98BE69B   # Model Std Vert     — 16B per vertex
 TAG_UV1             = 0x6B855EED   # Model UV1 Vert     — 4B per vertex (2×int16)
 TAG_COLORS          = 0x5CBA9DE9   # Model Col Vert     — 4B per vertex (uint32)
 TAG_MESHES          = 0x78D9CBDE   # Model Subset       — 64B each
-TAG_LOOK            = 0x3250BB80   # Model Look         — LOD/look table
+TAG_LOOK            = 0x06EB7EFC   # Model Look         — LOD/look table (confirmed from ALERT)
 TAG_SKIN_BATCH      = 0xC61B1FF5   # Model Skin Batch   — 16B each
 TAG_SKIN_DATA       = 0xDCA379A2   # Model Skin Data    — variable
 TAG_RCRA_WEIGHTS    = 0xCCBAFF15   # RCRA weights       — 8B per vertex
 TAG_JOINTS          = 0x15DF9D3B   # Model Joint        — 16B each
 TAG_JOINT_XFORMS    = 0xDCC88A19   # Joint transforms   — (3×4 + 4×4) floats each
 TAG_BUILT           = 0x283D0383   # Model Built        — UV scale etc.
-TAG_MATERIALS       = 0x3250BB80   # Material names
+TAG_MATERIALS       = 0x3250BB80   # Material name string offsets
 
 
 # ── Normal decoding (from ALERT geo.py _decode_normal) ────────────────────────
@@ -104,6 +104,7 @@ class MeshDefinition:
     first_skin_batch:  int
     skin_batches_count: int
     first_weight_index: int
+    lod_level:         int = 0   # LOD index (0 = highest detail), populated by _parse_look
 
     @property
     def indices_are_relative(self) -> bool:
@@ -128,6 +129,7 @@ class ModelAsset:
     joint_positions:  list[tuple] = field(default_factory=list)
     joint_quaternions: list[tuple] = field(default_factory=list)
     rcra_weights:     list         = field(default_factory=list)  # per-vertex list of (bone, weight) pairs
+    lod_count:        int          = 1    # number of LOD levels detected from Look section
     skin_data:        Optional[bytes] = None
     skin_batches:     list = field(default_factory=list)
 
@@ -172,6 +174,9 @@ class ModelParser:
                 rgba = struct.unpack_from('<BBBB', col_data, i * 4)
                 vertexes[i].r, vertexes[i].g, vertexes[i].b, vertexes[i].a = rgba
 
+        # Parse Look section → assign lod_level to each MeshDefinition
+        lod_count = self._parse_look(dat1, meshes)
+
         return ModelAsset(
             vertexes          = vertexes,
             meshes            = meshes,
@@ -182,6 +187,7 @@ class ModelParser:
             rcra_weights      = rcra_w,
             skin_data         = skin_data,
             skin_batches      = skin_batch,
+            lod_count         = lod_count,
         )
 
     # ── Vertexes (section 0xA98BE69B) ─────────────────────────────────────────
@@ -192,7 +198,12 @@ class ModelParser:
             return []
         vertexes = []
         SCALE = 1.0 / 4096.0
-        UV_SCALE = 1.0 / 32768.0
+
+        # UV scale from TAG_BUILT (0x283D0383) — confirmed from ALERT unknowns.py:
+        #   float at offset 0x30, reinterpreted as int, then:
+        #   uv_scale = (1 << (iuvscale & 0xF)) / 16384.0
+        UV_SCALE = self._read_uv_scale(dat1)
+
         for i in range(0, len(data) - 15, 16):
             X, Y, Z, _W, NXYZ, U, V = struct.unpack_from('<4hI2h', data, i)
             nx, ny, nz = _decode_normal(NXYZ)
@@ -203,6 +214,31 @@ class ModelParser:
                 v  = V * UV_SCALE,
             ))
         return vertexes
+
+    def _read_uv_scale(self, dat1: DAT1) -> float:
+        """
+        Read the UV scale from TAG_BUILT section (0x283D0383).
+        Formula confirmed from ALERT dat1lib/types/sections/model/unknowns.py:
+          values = array of float32 at every 4 bytes
+          float_val = values[0x30 // 4]  (float at byte offset 0x30)
+          iuvscale  = reinterpret float bits as int32
+          uv_scale  = (1 << (iuvscale & 0xF)) / 16384.0
+        Default fallback: 1/32768.0 (= scale of 1, i.e. 2^0 / 16384 * 2)
+        """
+        try:
+            built = dat1.get_section(TAG_BUILT)
+            if not built or len(built) < 0x34:
+                return 1.0 / 32768.0
+            # Read float at offset 0x30
+            float_val = struct.unpack_from('<f', built, 0x30)[0]
+            # Reinterpret float bits as int32
+            iuvscale = struct.unpack('<i', struct.pack('<f', float_val))[0]
+            uv_scale = (1 << (iuvscale & 0xF)) / 16384.0
+            print(f"[mesh] UV scale: float={float_val} iuvscale={iuvscale} uv_scale={uv_scale:.8f} (1/{1/uv_scale:.1f})")
+            return uv_scale
+        except Exception as ex:
+            print(f"[mesh] UV scale read failed: {ex}, using default")
+            return 1.0 / 32768.0
 
     # ── Indexes (section 0x0859863D) ──────────────────────────────────────────
 
@@ -248,6 +284,76 @@ class ModelParser:
                 first_weight_index = fwi,
             ))
         return meshes
+
+    def _parse_look(self, dat1: DAT1, meshes: list) -> int:
+        """
+        Parse the Look section (TAG_LOOK = 0x06EB7EFC).
+
+        Format confirmed from ALERT look.py:
+          The section contains N 'looks' (render variants — e.g. default, damaged).
+          Each look contains 8 LOD entries (for RCRA; 4 for SO).
+          Each LOD entry is <HH> = (start: uint16, count: uint16)
+            start = first mesh index for this LOD
+            count = number of meshes in this LOD
+
+          Total section size = N_looks × 8_lods × 4_bytes
+
+        We assign lod_level to each MeshDefinition based on which LOD slot it
+        falls into within look[0] (the default/primary look).
+        Returns the number of active LOD levels in look[0].
+        """
+        data = dat1.get_section(TAG_LOOK)
+        if not data:
+            return self._lod_heuristic(meshes)
+
+        data = bytes(data)
+        LODS_PER_LOOK = 8   # always 8 for RCRA
+        ENTRY_SIZE    = 4   # 2× uint16 per LOD entry
+        LOOK_SIZE     = LODS_PER_LOOK * ENTRY_SIZE  # 32 bytes per look
+
+        if len(data) < LOOK_SIZE:
+            return self._lod_heuristic(meshes)
+
+        n_looks = len(data) // LOOK_SIZE
+        print(f"[mesh] Look section: {n_looks} looks, {LODS_PER_LOOK} LOD slots each")
+
+        # Parse look[0] (primary/default look) — assign lod_level to meshes
+        active_lods = 0
+        for lod_idx in range(LODS_PER_LOOK):
+            off = lod_idx * ENTRY_SIZE
+            start, count = struct.unpack_from('<HH', data, off)
+            if count == 0:
+                continue   # unused LOD slot
+            active_lods = lod_idx + 1
+            for mi in range(start, min(start + count, len(meshes))):
+                meshes[mi].lod_level = lod_idx
+
+        # Any meshes not covered by look[0] get lod_level 0 (fallback)
+        print(f"[mesh] Look[0]: {active_lods} active LOD levels")
+        return max(1, active_lods)
+
+    def _lod_heuristic(self, meshes: list) -> int:
+        """
+        Fallback LOD detection when no Look section is present.
+        Detects LOD boundaries by finding where the material_index sequence resets.
+        """
+        if not meshes or len(meshes) <= 3:
+            return 1
+        first_mat = meshes[0].material_index
+        lod_starts = [0]
+        for i in range(1, len(meshes)):
+            if meshes[i].material_index == first_mat and i > lod_starts[-1] + 1:
+                lod_starts.append(i)
+                if len(lod_starts) >= 8:
+                    break
+        if len(lod_starts) > 1:
+            for lod_idx, start in enumerate(lod_starts):
+                end = lod_starts[lod_idx + 1] if lod_idx + 1 < len(lod_starts) else len(meshes)
+                for mi in range(start, end):
+                    meshes[mi].lod_level = lod_idx
+            print(f"[mesh] No Look section — heuristic detected {len(lod_starts)} LODs")
+            return len(lod_starts)
+        return 1
 
     # ── Joints (section 0x15DF9D3B) ───────────────────────────────────────────
 

@@ -8,9 +8,10 @@ Supports jump-to-offset and range highlighting.
 """
 
 import math
+import os
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
-    QScrollBar, QLineEdit, QPushButton, QSizePolicy
+    QScrollBar, QLineEdit, QPushButton, QSizePolicy, QFileDialog
 )
 from PyQt6.QtCore import Qt, QRect, QSize
 from PyQt6.QtGui import (
@@ -213,13 +214,15 @@ class HexInspector(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._data: bytes = b''
+        self._data:  bytes = b''
+        self._label: str   = ''
         self._build_ui()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def load_data(self, data: bytes, label: str = ""):
-        self._data = data
+        self._data  = data
+        self._label = label
         self._hex_view.set_data(data)
         self._scrollbar.setMaximum(max(0, math.ceil(len(data) / BYTES_PER_ROW) - 1))
         self._scrollbar.setValue(0)
@@ -228,6 +231,48 @@ class HexInspector(QWidget):
             f"{len(data):,} bytes  ·  {rows:,} rows"
             + (f"  ·  {label}" if label else "")
         )
+        self._btn_export.setEnabled(True)
+
+    def _do_export(self):
+        if not self._data:
+            return
+        # Suggest a filename based on the label (strip path separators)
+        safe = self._label.replace('/', '_').replace('\\', '_') or "hex_dump"
+        default = f"{safe}.txt"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Hex Dump", default, "Text Files (*.txt);;All Files (*.*)"
+        )
+        if not path:
+            return
+        # Build classic hex dump text
+        lines = []
+        data = self._data
+        n    = len(data)
+        lines.append(f"# RCRA Forge Hex Dump")
+        lines.append(f"# Asset:  {self._label}")
+        lines.append(f"# Size:   {n:,} bytes  ({n:#010x})")
+        lines.append(f"# Rows:   {math.ceil(n / BYTES_PER_ROW):,}  (16 bytes/row)")
+        lines.append("")
+        lines.append(f"{'Offset':<10}  {'00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F':<51}  ASCII")
+        lines.append("-" * 75)
+        for row in range(math.ceil(n / BYTES_PER_ROW)):
+            offset = row * BYTES_PER_ROW
+            chunk  = data[offset:offset + BYTES_PER_ROW]
+            hex_lo = ' '.join(f'{b:02X}' for b in chunk[:8])
+            hex_hi = ' '.join(f'{b:02X}' for b in chunk[8:])
+            # Pad short rows
+            hex_lo = hex_lo.ljust(23)
+            hex_hi = hex_hi.ljust(23)
+            ascii_ = ''.join(chr(b) if 0x20 <= b < 0x7F else '.' for b in chunk)
+            lines.append(f"{offset:08X}   {hex_lo}  {hex_hi}   {ascii_}")
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines))
+            self._size_lbl.setText(
+                f"{n:,} bytes  ·  exported → {os.path.basename(path)}"
+            )
+        except Exception as ex:
+            self._size_lbl.setText(f"Export failed: {ex}")
 
     def highlight(self, start: int, end: int):
         self._hex_view.set_highlight(start, end)
@@ -265,6 +310,16 @@ class HexInspector(QWidget):
         btn.setFixedSize(22, 22)
         btn.clicked.connect(self._do_jump)
         hl.addWidget(btn)
+
+        # Export hex dump button
+        self._btn_export = QPushButton("⬇  Export .txt")
+        self._btn_export.setObjectName("ExportBtn")
+        self._btn_export.setFixedHeight(24)
+        self._btn_export.setEnabled(False)
+        self._btn_export.setToolTip("Save full hex dump as a .txt file for analysis")
+        self._btn_export.clicked.connect(self._do_export)
+        hl.addWidget(self._btn_export)
+
         layout.addWidget(hdr)
 
         # Content row: hex view + vertical scrollbar

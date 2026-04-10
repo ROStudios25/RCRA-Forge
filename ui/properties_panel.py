@@ -115,6 +115,7 @@ class GroupExportWorker(QObject):
 
 class PropertiesPanel(QWidget):
     request_export = pyqtSignal(str, str)   # (output_path, format_string)
+    lod_changed    = pyqtSignal(int)        # emitted when user picks a different LOD
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -174,11 +175,13 @@ class PropertiesPanel(QWidget):
         self._lbl_tris   = self._field_label()
         self._lbl_submsh = self._field_label()
         self._lbl_lods   = self._field_label()
+        self._lbl_bones  = self._field_label()
 
         mform.addRow("Vertices:",   self._lbl_verts)
         mform.addRow("Triangles:",  self._lbl_tris)
         mform.addRow("Sub-meshes:", self._lbl_submsh)
         mform.addRow("LOD levels:", self._lbl_lods)
+        mform.addRow("Bones:",      self._lbl_bones)
 
         self._mesh_group.setVisible(False)
         layout.addWidget(self._mesh_group)
@@ -200,10 +203,17 @@ class PropertiesPanel(QWidget):
         fmt_row.addWidget(self._fmt_combo)
         elayout.addLayout(fmt_row)
 
-        # Options
-        self._chk_lod0 = QCheckBox("LOD 0 only")
-        self._chk_lod0.setChecked(True)
-        elayout.addWidget(self._chk_lod0)
+        # LOD selector
+        lod_row = QHBoxLayout()
+        lod_row.addWidget(QLabel("LOD:"))
+        self._lod_combo = QComboBox()
+        self._lod_combo.setObjectName("FmtCombo")
+        self._lod_combo.addItem("LOD 0  (highest)")
+        self._lod_combo.setEnabled(False)
+        self._lod_combo.setToolTip("Select which Level of Detail to view and export")
+        self._lod_combo.currentIndexChanged.connect(self._on_lod_changed)
+        lod_row.addWidget(self._lod_combo)
+        elayout.addLayout(lod_row)
 
         # Export button
         self._btn_export = QPushButton("⬇  Export Asset")
@@ -289,9 +299,21 @@ class PropertiesPanel(QWidget):
         self._lbl_verts.setText(f"{total_verts:,}")
         self._lbl_tris.setText(f"{total_tris:,}")
         self._lbl_submsh.setText(str(len(model_asset.meshes)))
-        self._lbl_lods.setText(f"{len(model_asset.joints)} bones")
+        self._lbl_lods.setText(str(getattr(model_asset, 'lod_count', 1)))
+        self._lbl_bones.setText(str(len(model_asset.joints)))
         self._mesh_group.setVisible(True)
         self._btn_export.setEnabled(True)
+
+        # Populate LOD selector
+        self._lod_combo.blockSignals(True)
+        self._lod_combo.clear()
+        lod_count = getattr(model_asset, 'lod_count', 1)
+        for i in range(lod_count):
+            label = "highest detail" if i == 0 else f"lower detail"
+            self._lod_combo.addItem(f"LOD {i}  ({label})")
+        self._lod_combo.setCurrentIndex(0)
+        self._lod_combo.setEnabled(lod_count > 1)
+        self._lod_combo.blockSignals(False)
 
     def set_archive_path(self, path: str):
         """Store the loaded toc path so group export can open WADs."""
@@ -313,6 +335,9 @@ class PropertiesPanel(QWidget):
         self._log.append(msg)
 
     # ── Private ───────────────────────────────────────────────────────────────
+
+    def _on_lod_changed(self, index: int):
+        self.lod_changed.emit(index)
 
     def _do_export_group(self):
         if not self._group:

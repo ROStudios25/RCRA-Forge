@@ -82,12 +82,12 @@ DXGI_BC7  = 0x62
 
 @dataclass
 class TextureAsset:
-    # SD = standard definition (always available)
+    # SD = standard definition (always available, at offset 0x44 in DAT1)
     sd_len:    int
     sd_width:  int
     sd_height: int
     sd_mips:   int
-    # HD = high definition (may require separate HD archive)
+    # HD = high definition (separate TOC entry, same asset ID, larger archive)
     hd_len:    int
     hd_width:  int
     hd_height: int
@@ -96,20 +96,21 @@ class TextureAsset:
     fmt:       int         # DXGI_FORMAT value
     array_size: int
     planes:    int
-    # Raw pixel data (SD resolution, prepended via asset header blob)
-    pixel_data: bytes = b''
+    # Pixel data
+    pixel_data:    bytes = b''   # SD pixel data
+    hd_pixel_data: bytes = b''   # HD pixel data (injected externally)
 
     @property
     def width(self) -> int:
-        return self.sd_width
+        return self.hd_width if self.hd_pixel_data and self.hd_width > 0 else self.sd_width
 
     @property
     def height(self) -> int:
-        return self.sd_height
+        return self.hd_height if self.hd_pixel_data and self.hd_height > 0 else self.sd_height
 
     @property
     def mips(self) -> int:
-        return self.sd_mips
+        return self.hd_mips if self.hd_pixel_data else self.sd_mips
 
     @property
     def format_name(self) -> str:
@@ -120,8 +121,75 @@ class TextureAsset:
         return self.fmt in (DXGI_DXT1, DXGI_DXT3, DXGI_DXT5,
                             DXGI_ATI1, DXGI_ATI2, DXGI_BC7)
 
-    def to_dds_bytes(self) -> bytes:
-        return _build_dds(self)
+    def decode_to_rgba(self) -> Optional[bytes]:
+        """
+        Decode compressed pixel data to raw RGBA8 bytes using imagecodecs.
+        Prefers HD pixel data if available, falls back to SD.
+        Returns flat bytes (width × height × 4) or None on failure.
+        """
+        # Prefer HD data if available
+        if self.hd_pixel_data and self.hd_width > 0 and self.hd_height > 0:
+            data = self.hd_pixel_data
+            w, h = self.hd_width, self.hd_height
+        elif self.pixel_data and self.sd_width > 0 and self.sd_height > 0:
+            data = self.pixel_data
+            w, h = self.sd_width, self.sd_height
+        else:
+            return None
+        try:
+            import imagecodecs
+            import numpy as np
+
+            # Map DXGI format → BCN format number
+            BCN_MAP = {
+                0x47: 1,   # BC1_UNORM  (DXT1)
+                0x41: 1,   # BC1_UNORM_SRGB
+                0x4A: 2,   # BC2_UNORM  (DXT3)
+                0x4D: 3,   # BC3_UNORM  (DXT5)
+                0x4F: 3,   # BC3_UNORM_SRGB
+                0x50: 4,   # BC4_UNORM
+                0x53: 5,   # BC5_UNORM
+                0x5B: 5,   # BC5_SNORM
+                0x62: 7,   # BC7_UNORM
+                0x63: 7,   # BC7_UNORM_SRGB
+            }
+            bcn = BCN_MAP.get(self.fmt)
+            if bcn is None:
+                # Uncompressed R8G8B8A8
+                if self.fmt == 0x1C:
+                    return bytes(data[:w * h * 4])
+                return None
+
+            # BC4=1 channel, BC5=2 channels, others=4 channels
+            channels = {1: 4, 2: 4, 3: 4, 7: 4}.get(bcn, None)
+            if bcn == 4:
+                channels = 1
+            elif bcn == 5:
+                channels = 2
+
+            shape = (h, w, channels) if channels > 1 else (h, w)
+            arr = imagecodecs.bcn_decode(data, format=bcn, shape=shape)
+            arr = arr.astype(np.uint8)
+
+            # Normalize to RGBA
+            if arr.ndim == 2:  # BC4 single channel → replicate to RGB
+                rgba = np.zeros((h, w, 4), dtype=np.uint8)
+                rgba[:, :, 0] = arr
+                rgba[:, :, 1] = arr
+                rgba[:, :, 2] = arr
+                rgba[:, :, 3] = 255
+                return rgba.tobytes()
+            elif arr.shape[2] == 2:  # BC5 RG → pad BA
+                rgba = np.zeros((h, w, 4), dtype=np.uint8)
+                rgba[:, :, 0] = arr[:, :, 0]
+                rgba[:, :, 1] = arr[:, :, 1]
+                rgba[:, :, 3] = 255
+                return rgba.tobytes()
+            else:  # BC1/BC2/BC3/BC7 already RGBA
+                return arr.tobytes()
+        except Exception as ex:
+            print(f"[texture] decode_to_rgba failed: {ex}")
+            return None
 
     def to_png_bytes(self) -> Optional[bytes]:
         """Decode pixel data to PNG via Pillow if available."""
@@ -170,35 +238,21 @@ class TextureParser:
         fmt, unk                 = struct.unpack_from('<HQ', sec, 20)
         sd_mips, unk2, hd_mips, unk3 = struct.unpack_from('<BBBB', sec, 30)
 
-        # Pixel data: for RCRA the TOC prepends a 36-byte header blob to the
-        # asset bytes; the actual pixel data follows the DAT1 section data.
-        # We look for pixel bytes after the end of the DAT1 payload.
+        # SD pixel data location (confirmed from ALERT textures.py):
+        # The raw DAT1 bytes contain the texture header section (44 bytes) at
+        # the start, then the pixel data follows immediately.
+        # Offset = 0x80 - 36 = 0x44 = 68 bytes from start of raw DAT1.
+        # This is because the DAT1 header (16B) + section directory (1 entry × 12B)
+        # + section data (44B) = 72B, but ALERT uses offset 0x44 = 68B.
+        # In practice: pixel data starts right after the 44-byte section data,
+        # which sits at DAT1_header(16) + dir(12) + section(44) = 72... 
+        # but we just scan for the pixel bytes after the section.
+        #
+        # Simpler: _raw_dat1[0x44:] = pixel data (ALERT confirmed offset)
+        PIXEL_OFFSET = 0x44   # 68 bytes — ALERT: offset = 0x80 - 36
         pixel_data = b''
-        # The sd_len bytes of pixel data are appended after the DAT1 container
-        # (extract_asset() prepends the header blob, so the layout is:
-        #   [36-byte header blob] + [DAT1 container]
-        # The header blob itself IS the pixel data for the SD texture.
-        # We detect this: if data length > DAT1 total_size + 8, leading bytes = pixel data
-        dat1_start = 0
-        if len(self.data) >= 4:
-            # Check if first 4 bytes are DAT1 magic
-            magic = struct.unpack_from('<I', self.data, 0)[0]
-            if magic != 0x44415431:
-                # Data starts with prepended header blob (36 bytes of pixel data header)
-                # The actual SD pixel data comes from a separate read; the 36-byte blob
-                # is the texture header summary. The pixel bytes follow the DAT1 in the archive.
-                dat1_start = 36
-                pixel_data = bytes(self.data[:36])  # placeholder — real data from archive
-
-        # If sd_len is set and there's trailing data after the DAT1, that's the pixels
-        if dat1_start == 0 and len(self.data) > 0:
-            # Find where DAT1 ends
-            if len(self.data) >= 12:
-                m2 = struct.unpack_from('<I', self.data, 0)[0]
-                if m2 == 0x44415431:
-                    total = struct.unpack_from('<I', self.data, 8)[0]
-                    if total < len(self.data):
-                        pixel_data = self.data[total:]
+        if sd_len > 0 and len(self.data) > PIXEL_OFFSET:
+            pixel_data = bytes(self.data[PIXEL_OFFSET:PIXEL_OFFSET + sd_len])
 
         return TextureAsset(
             sd_len     = sd_len,

@@ -56,9 +56,11 @@ in vec3 vNormal;
 in vec3 vWorldPos;
 in vec2 vUV;
 
-uniform vec3  uLightDir;
-uniform vec3  uBaseColor;
-uniform bool  uWireframe;
+uniform vec3      uLightDir;
+uniform vec3      uBaseColor;
+uniform bool      uWireframe;
+uniform bool      uHasTexture;
+uniform sampler2D uAlbedo;
 
 out vec4 FragColor;
 
@@ -69,7 +71,13 @@ void main() {
     }
     vec3 n    = normalize(vNormal);
     float NdL = max(dot(n, normalize(uLightDir)), 0.15);
-    vec3 col  = uBaseColor * NdL + uBaseColor * 0.3;
+    vec3 col;
+    if (uHasTexture) {
+        vec3 tex = texture(uAlbedo, vUV).rgb;
+        col = tex * NdL + tex * 0.3;
+    } else {
+        col = uBaseColor * NdL + uBaseColor * 0.3;
+    }
     FragColor = vec4(col, 1.0);
 }
 """
@@ -191,6 +199,7 @@ class GpuSubMesh:
         self.index_count: int = 0
         self.index_type: int = 0   # GL_UNSIGNED_SHORT or GL_UNSIGNED_INT
         self.color: tuple = (0.75, 0.75, 0.75)
+        self.texture_id: int = 0   # OpenGL texture object, 0 = no texture
 
     def upload(self, positions: np.ndarray, normals: np.ndarray,
                uvs: np.ndarray, indices: np.ndarray):
@@ -250,6 +259,9 @@ class GpuSubMesh:
             glDeleteBuffers(1, [self.vbo])
             glDeleteBuffers(1, [self.ebo])
             self.vao = 0
+        if self.texture_id:
+            glDeleteTextures(1, [self.texture_id])
+            self.texture_id = 0
 
 
 # ── Viewport Widget ───────────────────────────────────────────────────────────
@@ -274,6 +286,7 @@ class Viewport3D(QOpenGLWidget):
         self._redraw_pending = False
         self._grid_y         = 0.0
         self._grid_fade_r    = 2.0
+        self._cached_material_textures: dict = {}   # persists across LOD switches
         self.setMinimumSize(400, 300)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.WheelFocus)
@@ -301,11 +314,89 @@ class Viewport3D(QOpenGLWidget):
 
     def load_mesh(self, model: ModelAsset):
         """Queue a model for GPU upload — actual upload happens in paintGL."""
-        self._pending_model = model
+        self._pending_model  = model
+        self._active_lod     = 0   # reset to LOD0 on new model load
+        self._cached_material_textures = {}   # clear texture cache for new model
         if hasattr(self, '_cam_logged'):
             del self._cam_logged
         from PyQt6.QtCore import QTimer
         QTimer.singleShot(10, self._trigger_repaint)
+
+    def load_textures(self, material_textures: dict):
+        """
+        Upload albedo textures to GPU and assign to matching sub-meshes.
+        Caches the pixel data so textures survive LOD switches.
+
+        Parameters
+        ----------
+        material_textures : dict
+            Maps material_index (int) → (rgba_bytes, width, height)
+        """
+        # Cache for re-application after LOD switches
+        self._cached_material_textures = material_textures
+
+        if not _HAS_OPENGL or not self.isValid():
+            self._pending_textures = material_textures
+            self._trigger_repaint()
+            return
+        self.makeCurrent()
+        self._upload_textures(material_textures)
+        self.doneCurrent()
+        self._trigger_repaint()
+
+    def _upload_textures(self, material_textures: dict):
+        """Upload RGBA8 pixel data as OpenGL textures and assign to GpuSubMeshes."""
+        import ctypes
+        gl_tex_map = {}   # material_index → gl texture id
+
+        for mat_idx, (rgba_bytes, w, h) in material_textures.items():
+            if not rgba_bytes or w == 0 or h == 0:
+                continue
+            try:
+                tex_id = glGenTextures(1)
+                glBindTexture(GL_TEXTURE_2D, tex_id)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT)
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0,
+                             GL_RGBA, GL_UNSIGNED_BYTE,
+                             (ctypes.c_uint8 * len(rgba_bytes))(*rgba_bytes))
+                glGenerateMipmap(GL_TEXTURE_2D)
+                glBindTexture(GL_TEXTURE_2D, 0)
+                gl_tex_map[mat_idx] = tex_id
+                print(f"[viewport] uploaded texture mat={mat_idx} {w}×{h}")
+            except Exception as ex:
+                print(f"[viewport] texture upload failed mat={mat_idx}: {ex}")
+
+        # Assign textures to GpuSubMeshes by material_index
+        model = getattr(self, '_current_model', None)
+        if model is None:
+            return
+        active_lod = getattr(self, '_active_lod', 0)
+        gpu_iter = iter(self._gpu_meshes)
+        for mesh in model.meshes:
+            if mesh.lod_level != active_lod:
+                continue
+            gm = next(gpu_iter, None)
+            if gm is None:
+                break
+            if mesh.material_index in gl_tex_map:
+                gm.texture_id = gl_tex_map[mesh.material_index]
+
+    def set_lod(self, lod_idx: int):
+        """Switch the viewport to show a different LOD level."""
+        if self._pending_model is None and not self._gpu_meshes:
+            return
+        model = getattr(self, '_current_model', None)
+        if model is None:
+            return
+        self._active_lod = lod_idx
+        self._pending_model = model   # re-upload with new LOD filter
+        # Re-apply cached textures after model re-upload
+        if self._cached_material_textures:
+            self._pending_textures = self._cached_material_textures
+        self._trigger_repaint()
 
     def _trigger_repaint(self):
         self._redraw()
@@ -313,13 +404,19 @@ class Viewport3D(QOpenGLWidget):
     def _upload_pending_model(self):
         """Called from paintGL — upload pending model with GL context active."""
         model = self._pending_model
-        self._pending_model = None
+        self._pending_model  = None
+        self._current_model  = model   # keep reference for LOD switching
+
+        active_lod = getattr(self, '_active_lod', 0)
 
         self._free_gpu_meshes()
         all_positions = []
         skipped = 0
 
         for i, mesh in enumerate(model.meshes):
+            # Filter by LOD level
+            if mesh.lod_level != active_lod:
+                continue
             positions, normals, uvs, indices = mesh_to_numpy(model, mesh)
             if positions is None or indices is None or len(positions) == 0:
                 skipped += 1
@@ -340,7 +437,7 @@ class Viewport3D(QOpenGLWidget):
             self._gpu_meshes.append(gpu)
             all_positions.append(positions)
 
-        print(f"[viewport] {len(self._gpu_meshes)} GPU meshes, {skipped} skipped")
+        print(f"[viewport] LOD{active_lod}: {len(self._gpu_meshes)} GPU meshes, {skipped} skipped")
 
         if all_positions:
             pts = np.concatenate(all_positions)
@@ -419,6 +516,12 @@ class Viewport3D(QOpenGLWidget):
         if self._pending_model is not None:
             self._upload_pending_model()
 
+        # Upload any pending textures
+        pending_tex = getattr(self, '_pending_textures', None)
+        if pending_tex is not None:
+            self._pending_textures = None
+            self._upload_textures(pending_tex)
+
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
         w, h = self.width(), self.height()
@@ -457,14 +560,26 @@ class Viewport3D(QOpenGLWidget):
             _set_uniform_3f(self._shader_prog, 'uLightDir', *light_dir)
             _set_uniform_bool(self._shader_prog, 'uWireframe', self._wireframe)
 
+            # Bind texture sampler to unit 0
+            loc_albedo = glGetUniformLocation(self._shader_prog, 'uAlbedo')
+            if loc_albedo >= 0:
+                glUniform1i(loc_albedo, 0)
+
             if self._wireframe:
                 glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)
             else:
                 glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
 
             for gm in self._gpu_meshes:
+                has_tex = gm.texture_id > 0 and not self._wireframe
+                _set_uniform_bool(self._shader_prog, 'uHasTexture', has_tex)
                 _set_uniform_3f(self._shader_prog, 'uBaseColor', *gm.color)
+                if has_tex:
+                    glActiveTexture(GL_TEXTURE0)
+                    glBindTexture(GL_TEXTURE_2D, gm.texture_id)
                 gm.draw()
+                if has_tex:
+                    glBindTexture(GL_TEXTURE_2D, 0)
 
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
 

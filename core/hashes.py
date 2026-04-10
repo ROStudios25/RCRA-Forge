@@ -116,6 +116,15 @@ class HashLookup:
         """Return full path or hex ID fallback."""
         return self._map.get(asset_id, f"{asset_id:016X}")
 
+    def asset_id(self, path: str) -> Optional[int]:
+        """
+        Reverse lookup: given a path string, return the asset ID (CRC64 hash).
+        Case-insensitive — hashes.txt stores lowercase paths.
+        """
+        if not hasattr(self, '_reverse_map'):
+            self._reverse_map = {v.lower(): k for k, v in self._map.items()}
+        return self._reverse_map.get(path.lower())
+
     def is_loaded(self) -> bool:
         return self._loaded
 

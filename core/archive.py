@@ -134,6 +134,8 @@ class DAT1:
         self._view    = memoryview(data)   # zero-copy view
         self.unk1     = 0
         self.sections: dict[int, memoryview] = {}
+        self._string_pool: bytes = b''
+        self._string_pool_base: int = 0   # absolute offset of pool in DAT1
         self._parse()
 
     def _parse(self):
@@ -161,6 +163,12 @@ class DAT1:
         self.unk1 = struct.unpack_from('<I', d, 4)[0]
         total_size = struct.unpack_from('<I', d, 8)[0]
         section_count, unknown_count = struct.unpack_from('<HH', d, 12)
+
+        # String pool sits between header and first section
+        # base = 16 + section_count*12 + unknown_count*8
+        pool_base = 16 + section_count * 12 + unknown_count * 8
+        self._string_pool_base = pool_base
+
         for i in range(section_count):
             base = 16 + i * 12
             if base + 12 > len(d):
@@ -169,8 +177,35 @@ class DAT1:
             if sec_offset + size <= len(d):
                 self.sections[tag] = d[sec_offset:sec_offset + size]
 
+        # Build string pool: bytes from pool_base up to first section offset
+        if section_count > 0 and pool_base < len(d):
+            first_sec_off = min(
+                struct.unpack_from('<I', d, 16 + i * 12 + 4)[0]
+                for i in range(section_count)
+                if 16 + i * 12 + 12 <= len(d)
+            )
+            pool_end = min(first_sec_off, len(d))
+            self._string_pool = bytes(d[pool_base:pool_end])
+
     def get_section(self, tag: int) -> Optional[memoryview]:
         return self.sections.get(tag)
+
+    def get_string(self, absolute_offset: int) -> Optional[str]:
+        """
+        Read a null-terminated string from the string pool.
+        absolute_offset is as stored in section data (absolute from DAT1 start).
+        Matches ALERT's DAT1.get_string(offset) behaviour.
+        """
+        rel = absolute_offset - self._string_pool_base
+        if rel < 0 or rel >= len(self._string_pool):
+            return None
+        end = self._string_pool.find(b'\x00', rel)
+        if end == -1:
+            end = len(self._string_pool)
+        try:
+            return self._string_pool[rel:end].decode('utf-8', errors='replace')
+        except Exception:
+            return None
 
     @property
     def asset_type(self) -> str:
@@ -383,6 +418,32 @@ class TocParser:
         arc = self.archives[entry.archive]
         return os.path.join(self.game_root, arc.filename)
 
+    def find_entry(self, asset_id: int) -> Optional['AssetEntry']:
+        """Find an AssetEntry by asset ID, or None if not found."""
+        import numpy as np
+        try:
+            ids_arr = self.entries._ids[:len(self.entries)]
+            hits = np.where(ids_arr == asset_id)[0]
+            if len(hits) == 0:
+                return None
+            return self.entries[int(hits[0])]
+        except Exception:
+            return None
+
+    def find_all_entries(self, asset_id: int) -> list:
+        """
+        Find ALL AssetEntries with this asset ID (may be multiple — SD + HD spans).
+        Returns entries sorted by size ascending (SD first, HD last).
+        """
+        import numpy as np
+        try:
+            ids_arr = self.entries._ids[:len(self.entries)]
+            hits = np.where(ids_arr == asset_id)[0]
+            entries = [self.entries[int(i)] for i in hits]
+            return sorted(entries, key=lambda e: e.size)
+        except Exception:
+            return []
+
 
 # ── Block decompression ───────────────────────────────────────────────────────
 
@@ -392,13 +453,12 @@ def _decompress_block(data: bytes, real_size: int, comp_type: int) -> bytearray:
         return bytearray(data[:real_size])
     elif comp_type == 2:
         try:
-            from dat1lib import gdeflate
+            from core import gdeflate
             return bytearray(gdeflate.decompress(data, real_size))
-        except ImportError:
+        except Exception as ex:
             raise RuntimeError(
-                "GDeflate compressed block found but 'gdeflate' module is not available.\n"
-                "This asset is in a GDeflate-compressed archive.\n"
-                "Install gdeflate: pip install gdeflate"
+                f"GDeflate decompression failed: {ex}\n"
+                "Ensure libdeflate.dll is in the working directory."
             )
     elif comp_type == 3:
         return bytearray(_insomniac_decompress(data, real_size))
