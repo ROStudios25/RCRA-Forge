@@ -200,8 +200,9 @@ class AssetLoader(QObject):
             if not lookup or not lookup.is_loaded():
                 return
 
-            # Collect unique material indices from LOD0
-            mat_indices = sorted({m.material_index for m in model.meshes if m.lod_level == 0})
+            # Collect unique material indices from look 0 / LOD 0 only
+            mat_indices = sorted({m.material_index for m in model.meshes
+                                  if m.look_index == 0 and m.lod_level == 0})
 
             # Read material names from TAG_MATERIALS section (0x3250BB80)
             from core.archive import DAT1
@@ -902,7 +903,14 @@ class MainWindow(QMainWindow):
         if self._toc_parser is None:
             self._status_lbl.setText("No TOC loaded — open a game folder first")
             return
-        self._props.set_entry(entry)
+
+        # Get display name from lookup for the export filename
+        lookup = self._browser._lookup
+        asset_name = None
+        if lookup and lookup.is_loaded():
+            asset_name = lookup.name(entry.asset_id)
+
+        self._props.set_entry(entry, name=asset_name)
         self._status_lbl.setText(f"Loading asset {entry.asset_id:#018x}…")
 
         self._asset_thread = QThread(self)
@@ -996,7 +1004,7 @@ class MainWindow(QMainWindow):
 
     def _show_about(self):
         QMessageBox.about(self, "About RCRA Forge",
-            "<h3>RCRA Forge v0.2.0</h3>"
+            "<h3>RCRA Forge v0.5.0</h3>"
             "<p>Ratchet &amp; Clank: Rift Apart level editor and model exporter.</p>"
             "<p>Format reverse engineering credit:<br>"
             "&nbsp;• chaoticgd / <i>ripped_apart</i> (MIT)<br>"

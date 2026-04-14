@@ -23,22 +23,23 @@ class ExportWorker(QObject):
     finished = pyqtSignal(str)      # output path on success
     error    = pyqtSignal(str)      # error message
 
-    def __init__(self, mesh_asset, path: str, fmt: str):
+    def __init__(self, mesh_asset, path: str, fmt: str, lod: int = 0):
         super().__init__()
         self.mesh  = mesh_asset
         self.path  = path
         self.fmt   = fmt
+        self.lod   = lod
 
     def run(self):
         try:
             from exporters.gltf_exporter import GltfExporter, ObjExporter
             name = os.path.splitext(os.path.basename(self.path))[0]
             if self.fmt == 'glb':
-                GltfExporter(self.mesh, name).export_glb(self.path)
+                GltfExporter(self.mesh, name, lod=self.lod).export_glb(self.path)
             elif self.fmt == 'gltf':
-                GltfExporter(self.mesh, name).export_gltf(self.path)
+                GltfExporter(self.mesh, name, lod=self.lod).export_gltf(self.path)
             elif self.fmt == 'obj':
-                ObjExporter(self.mesh, name).export(self.path)
+                ObjExporter(self.mesh, name, lod=self.lod).export(self.path)
             self.finished.emit(self.path)
         except Exception as ex:
             import traceback
@@ -120,10 +121,12 @@ class PropertiesPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._entry:      AssetEntry  = None
+        self._asset_name: str        = None
         self._mesh_asset             = None
         self._group                  = None   # AssetGroup for batch export
         self._archive_path: str      = None   # path to game 'toc' file
         self._export_thread: QThread = None
+        self._export_worker          = None   # keeps ExportWorker alive during thread run
         self._build_ui()
 
     def _build_ui(self):
@@ -269,8 +272,9 @@ class PropertiesPanel(QWidget):
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def set_entry(self, entry: AssetEntry):
+    def set_entry(self, entry: AssetEntry, name: str = None):
         self._entry = entry
+        self._asset_name = name  # display name from lookup (e.g. 'hero_ratchet')
         self._lbl_id.setText(f"{entry.asset_id:016X}")
         self._lbl_type.setText(f"archive {entry.archive}")
         self._lbl_size.setText(f"{entry.size:,} bytes")
@@ -384,7 +388,14 @@ class PropertiesPanel(QWidget):
         fmt = fmt_map[self._fmt_combo.currentIndex()]
         ext = f".{fmt}" if fmt in ('glb', 'obj') else ".gltf"
 
-        name = f"{self._entry.asset_id:016X}" if self._entry else "export"
+        # Use asset name from browser if available, fall back to hex ID
+        if self._asset_name:
+            name = os.path.splitext(self._asset_name)[0]
+        elif self._entry:
+            name = f"{self._entry.asset_id:016X}"
+        else:
+            name = "export"
+
         path, _ = QFileDialog.getSaveFileName(
             self, "Export Asset", name + ext,
             f"3D Files (*{ext});;All Files (*.*)"
@@ -392,20 +403,26 @@ class PropertiesPanel(QWidget):
         if not path:
             return
 
-        # Run on background thread
         self._btn_export.setEnabled(False)
         self._progress.setVisible(True)
         self._export_status.setText("Exporting…")
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents()
 
-        self._export_thread = QThread(self)
-        worker = ExportWorker(self._mesh_asset, path, fmt)
-        worker.moveToThread(self._export_thread)
-        self._export_thread.started.connect(worker.run)
-        worker.finished.connect(self._on_export_done)
-        worker.error.connect(self._on_export_error)
-        worker.finished.connect(self._export_thread.quit)
-        worker.error.connect(self._export_thread.quit)
-        self._export_thread.start()
+        try:
+            from exporters.gltf_exporter import GltfExporter, ObjExporter
+            lod  = self._lod_combo.currentIndex()
+            stem = os.path.splitext(os.path.basename(path))[0]
+            if fmt == 'glb':
+                GltfExporter(self._mesh_asset, stem, lod=lod).export_glb(path)
+            elif fmt == 'gltf':
+                GltfExporter(self._mesh_asset, stem, lod=lod).export_gltf(path)
+            elif fmt == 'obj':
+                ObjExporter(self._mesh_asset, stem, lod=lod).export(path)
+            self._on_export_done(path)
+        except Exception as ex:
+            import traceback
+            self._on_export_error(f"{ex}\n{traceback.format_exc()}")
 
     def _on_export_done(self, path: str):
         self._progress.setVisible(False)

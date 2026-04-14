@@ -2,22 +2,16 @@
 exporters/group_exporter.py
 Batch-export a group of related ModelAssets as a single GLB.
 
-Each source asset becomes one or more named mesh nodes in the output file so
-that Blender's outliner shows:
+Each source asset becomes one or more named mesh nodes under a shared root,
+with correct UV scaling, named materials, skeleton and skin weights — using
+the same GltfExporter pipeline as single-asset export.
 
-    npc_grunthor                     ← scene root (empty)
-      ├─ npc_grunthor_body           ← mesh node
-      ├─ npc_grunthor_arm_l          ← mesh node
-      ├─ npc_grunthor_damaged_01     ← mesh node
+Blender outliner result:
+    npc_grunthor                       ← scene root (empty)
+      ├─ npc_grunthor_body-subset0-LOD_0
+      ├─ npc_grunthor_body-subset1-LOD_0
+      ├─ npc_grunthor_arm_l-subset0-LOD_0
       └─ ...
-
-Usage
------
-    from exporters.group_exporter import GroupExporter
-    exporter = GroupExporter(slug="npc_grunthor")
-    exporter.add_model(model_asset, part_name="npc_grunthor_body")
-    exporter.add_model(model_asset2, part_name="npc_grunthor_arm_l")
-    exporter.export_glb("/path/to/npc_grunthor.glb")
 """
 
 from __future__ import annotations
@@ -30,30 +24,25 @@ from typing import Optional
 import numpy as np
 
 from core.mesh import ModelAsset, MeshDefinition, mesh_to_numpy
-
-# glTF constants (same as gltf_exporter.py)
-GLTF_FLOAT          = 5126
-GLTF_UNSIGNED_SHORT = 5123
-GLTF_UNSIGNED_INT   = 5125
-GLTF_ARRAY_BUFFER   = 34962
-GLTF_ELEMENT_ARRAY  = 34963
-
-GLB_MAGIC      = 0x46546C67
-GLB_JSON_CHUNK = 0x4E4F534A
-GLB_BIN_CHUNK  = 0x004E4942
+from exporters.gltf_exporter import (
+    GltfExporter,
+    GLTF_FLOAT, GLTF_UNSIGNED_BYTE, GLTF_UNSIGNED_SHORT, GLTF_UNSIGNED_INT,
+    GLTF_ARRAY_BUFFER, GLTF_ELEMENT_ARRAY,
+    GLB_MAGIC, GLB_JSON_CHUNK, GLB_BIN_CHUNK,
+    MAX_INFLUENCES,
+    _qxq, _rot_v, _quat_to_mat4_colmaj,
+)
 
 
 class GroupExporter:
     """
     Accumulate multiple ModelAssets and write them as a single GLB where
-    each source asset is a named node under a shared root.
+    each source asset is a set of named sub-mesh nodes under a shared root.
     """
 
     def __init__(self, slug: str = "group"):
         self.slug   = slug
-        self._parts: list[tuple[ModelAsset, str]] = []  # (model, part_name)
-
-    # ── Public API ────────────────────────────────────────────────────────────
+        self._parts: list[tuple[ModelAsset, str]] = []
 
     def add_model(self, model: ModelAsset, part_name: str):
         """Add one model (= one asset) to the group under *part_name*."""
@@ -75,158 +64,130 @@ class GroupExporter:
             f.write(struct.pack('<II', len(binary), GLB_BIN_CHUNK))
             f.write(binary)
 
-    # ── Internal build ────────────────────────────────────────────────────────
-
     def _build(self) -> tuple[dict, bytearray]:
-        binary      = bytearray()
-        views:      list[dict] = []
-        accessors:  list[dict] = []
-        meshes:     list[dict] = []
-        nodes:      list[dict] = []
-        materials:  list[dict] = []
-
-        # One shared default material
-        materials.append({
-            "name": "default",
-            "pbrMetallicRoughness": {
-                "baseColorFactor": [0.8, 0.8, 0.8, 1.0],
-                "metallicFactor": 0.0,
-                "roughnessFactor": 0.8,
-            },
-        })
+        # Use GltfExporter per part, then merge all their outputs
+        binary:     bytearray  = bytearray()
+        views:      list       = []
+        accessors:  list       = []
+        meshes:     list       = []
+        nodes:      list       = []
+        skins:      list       = []
+        materials:  list       = []
 
         child_node_indices: list[int] = []
 
         for model, part_name in self._parts:
-            primitives = []
-            for mesh_def in model.meshes:
-                prim = _build_primitive(mesh_def, model, binary, views, accessors, materials)
-                if prim:
-                    primitives.append(prim)
+            # Build this part using GltfExporter in isolation
+            exp = GltfExporter(model, name=part_name, lod=0)
+            part_doc = exp._build()
+            part_bin = bytes(exp._bin)
 
-            if not primitives:
+            if not part_doc.get('meshes'):
                 continue
 
-            mesh_idx = len(meshes)
-            meshes.append({"name": part_name, "primitives": primitives})
+            # Offset all buffer view byte offsets by current binary length
+            bin_offset = len(binary)
+            binary += part_bin
 
-            node_idx = len(nodes)
-            nodes.append({"name": part_name, "mesh": mesh_idx})
-            child_node_indices.append(node_idx)
+            # Remap accessor indices: offset by current counts
+            acc_offset  = len(accessors)
+            view_offset = len(views)
+            mat_offset  = len(materials)
+            node_offset = len(nodes)
+            skin_offset = len(skins)
 
-        # Root empty node
+            # Remap buffer views
+            for bv in part_doc.get('bufferViews', []):
+                bv_copy = dict(bv)
+                bv_copy['buffer'] = 0
+                bv_copy['byteOffset'] = bv_copy.get('byteOffset', 0) + bin_offset
+                views.append(bv_copy)
+
+            # Remap accessors
+            for acc in part_doc.get('accessors', []):
+                acc_copy = dict(acc)
+                acc_copy['bufferView'] = acc_copy['bufferView'] + view_offset
+                accessors.append(acc_copy)
+
+            # Remap materials
+            for mat in part_doc.get('materials', []):
+                materials.append(mat)
+
+            # Remap skins
+            part_skin_map = {}  # old skin idx → new skin idx
+            for si, skin in enumerate(part_doc.get('skins', [])):
+                skin_copy = dict(skin)
+                # Remap inverseBindMatrices accessor
+                if 'inverseBindMatrices' in skin_copy:
+                    skin_copy['inverseBindMatrices'] += acc_offset
+                # Joints will be remapped after nodes are added
+                new_si = len(skins)
+                part_skin_map[si] = new_si
+                skins.append(skin_copy)
+
+            # Remap nodes
+            part_node_map = {}  # old node idx → new node idx
+            for ni, node in enumerate(part_doc.get('nodes', [])):
+                node_copy = dict(node)
+                new_ni = len(nodes)
+                part_node_map[ni] = new_ni
+                nodes.append(node_copy)
+
+            # Fix up node children and skin references now that we have the map
+            for ni, node in enumerate(part_doc.get('nodes', [])):
+                new_ni = part_node_map[ni]
+                if 'children' in node:
+                    nodes[new_ni]['children'] = [
+                        part_node_map[c] for c in node['children']
+                    ]
+                if 'skin' in node:
+                    nodes[new_ni]['skin'] = part_skin_map[node['skin']] if node['skin'] in part_skin_map else node['skin'] + skin_offset
+
+            # Fix skin joint references
+            for si, skin in enumerate(part_doc.get('skins', [])):
+                new_si = part_skin_map[si]
+                skins[new_si]['joints'] = [
+                    part_node_map[j] for j in skin.get('joints', [])
+                ]
+
+            # Remap meshes (accessor indices in primitives)
+            for mesh in part_doc.get('meshes', []):
+                mesh_copy = dict(mesh)
+                new_prims = []
+                for prim in mesh_copy.get('primitives', []):
+                    prim_copy = dict(prim)
+                    prim_copy['attributes'] = {
+                        k: v + acc_offset
+                        for k, v in prim['attributes'].items()
+                    }
+                    prim_copy['indices'] = prim['indices'] + acc_offset
+                    if 'material' in prim_copy:
+                        prim_copy['material'] = prim_copy['material'] + mat_offset
+                    new_prims.append(prim_copy)
+                mesh_copy['primitives'] = new_prims
+                meshes.append(mesh_copy)
+
+            # Collect the mesh node indices for this part (scene nodes from part)
+            scene_node_indices = part_doc.get('scenes', [{}])[0].get('nodes', [])
+            for old_ni in scene_node_indices:
+                child_node_indices.append(part_node_map[old_ni])
+
+        # Root empty node grouping all parts
         root_idx = len(nodes)
         nodes.append({"name": self.slug, "children": child_node_indices})
 
         buf = {"byteLength": len(binary)}
-
         doc = {
-            "asset": {"version": "2.0", "generator": "RCRA Forge — Group Export"},
-            "scene": 0,
-            "scenes": [{"name": self.slug, "nodes": [root_idx]}],
-            "nodes":      nodes,
-            "meshes":     meshes,
-            "materials":  materials,
-            "accessors":  accessors,
+            "asset":       {"version": "2.0", "generator": "RCRA Forge — Group Export"},
+            "scene":       0,
+            "scenes":      [{"name": self.slug, "nodes": [root_idx]}],
+            "nodes":       nodes,
+            "meshes":      meshes,
+            "materials":   materials,
+            "accessors":   accessors,
             "bufferViews": views,
-            "buffers":    [buf],
+            "buffers":     [buf],
         }
+        if skins:
+            doc["skins"] = skins
         return doc, binary
-
-
-# ── Helpers (module-level so they're reusable) ────────────────────────────────
-
-def _build_primitive(
-    mesh: MeshDefinition,
-    model: ModelAsset,
-    binary: bytearray,
-    views: list,
-    accessors: list,
-    materials: list,
-) -> Optional[dict]:
-    positions, normals, uvs, indices = mesh_to_numpy(model, mesh)
-    if positions is None or indices is None or len(positions) == 0:
-        return None
-
-    attribs: dict = {}
-    attribs["POSITION"] = _add_accessor(
-        positions, "VEC3", GLTF_FLOAT, GLTF_ARRAY_BUFFER, binary, views, accessors, minmax=True
-    )
-    if normals is not None:
-        attribs["NORMAL"] = _add_accessor(
-            normals, "VEC3", GLTF_FLOAT, GLTF_ARRAY_BUFFER, binary, views, accessors
-        )
-    if uvs is not None:
-        attribs["TEXCOORD_0"] = _add_accessor(
-            uvs, "VEC2", GLTF_FLOAT, GLTF_ARRAY_BUFFER, binary, views, accessors
-        )
-
-    if indices.max() < 65536:
-        idx_acc = _add_accessor(
-            indices.astype(np.uint16).reshape(-1, 1),
-            "SCALAR", GLTF_UNSIGNED_SHORT, GLTF_ELEMENT_ARRAY,
-            binary, views, accessors, is_scalar=True,
-        )
-    else:
-        idx_acc = _add_accessor(
-            indices.astype(np.uint32).reshape(-1, 1),
-            "SCALAR", GLTF_UNSIGNED_INT, GLTF_ELEMENT_ARRAY,
-            binary, views, accessors, is_scalar=True,
-        )
-
-    mat_idx = min(mesh.material_index, len(materials) - 1)
-    return {"attributes": attribs, "indices": idx_acc, "material": mat_idx, "mode": 4}
-
-
-def _add_accessor(
-    arr: np.ndarray,
-    acc_type: str,
-    component_type: int,
-    target: int,
-    binary: bytearray,
-    views: list,
-    accessors: list,
-    is_scalar: bool = False,
-    minmax: bool = False,
-) -> int:
-    if component_type == GLTF_FLOAT:
-        raw   = arr.astype(np.float32).tobytes()
-        align = 4
-    elif component_type == GLTF_UNSIGNED_SHORT:
-        raw   = arr.astype(np.uint16).tobytes()
-        align = 2
-    elif component_type == GLTF_UNSIGNED_INT:
-        raw   = arr.astype(np.uint32).tobytes()
-        align = 4
-    else:
-        raw   = arr.astype(np.uint8).tobytes()
-        align = 1
-
-    while len(binary) % align:
-        binary += b'\x00'
-    byte_offset = len(binary)
-    binary += raw
-
-    view_idx = len(views)
-    views.append({
-        "buffer": 0,
-        "byteOffset": byte_offset,
-        "byteLength": len(raw),
-        "target": target,
-    })
-
-    n   = arr.size if is_scalar else arr.shape[0]
-    acc: dict = {
-        "bufferView":    view_idx,
-        "byteOffset":    0,
-        "componentType": component_type,
-        "count":         n,
-        "type":          acc_type,
-    }
-    if minmax and acc_type == "VEC3" and component_type == GLTF_FLOAT:
-        acc["min"] = arr.min(axis=0).tolist()
-        acc["max"] = arr.max(axis=0).tolist()
-
-    idx = len(accessors)
-    accessors.append(acc)
-    return idx

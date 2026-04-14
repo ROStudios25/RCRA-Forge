@@ -105,6 +105,7 @@ class MeshDefinition:
     skin_batches_count: int
     first_weight_index: int
     lod_level:         int = 0   # LOD index (0 = highest detail), populated by _parse_look
+    look_index:        int = 0   # Look index (0 = primary/default look)
 
     @property
     def indices_are_relative(self) -> bool:
@@ -132,6 +133,7 @@ class ModelAsset:
     lod_count:        int          = 1    # number of LOD levels detected from Look section
     skin_data:        Optional[bytes] = None
     skin_batches:     list = field(default_factory=list)
+    material_names:   list[str]    = field(default_factory=list)  # short name per material index
 
 
 # ── Parser ────────────────────────────────────────────────────────────────────
@@ -151,7 +153,8 @@ class ModelParser:
     def parse(self) -> ModelAsset:
         dat1 = self.dat1
 
-        vertexes   = self._parse_vertexes(dat1)
+        uv_scale   = self._read_uv_scale(dat1)
+        vertexes   = self._parse_vertexes(dat1, uv_scale)
         indexes    = self._parse_indexes(dat1)
         meshes     = self._parse_meshes(dat1)
         joints, jpos, jquat = self._parse_joints(dat1)
@@ -160,12 +163,17 @@ class ModelParser:
         skin_batch = self._parse_skin_batches(dat1)
 
         # Overlay UV1 channel if present
+        # UV1 raw int16 values use the same uv_scale as the base vertex channel
         uv1_data = dat1.get_section(TAG_UV1)
         if uv1_data:
             for i in range(min(len(vertexes), len(uv1_data) // 4)):
                 u_raw, v_raw = struct.unpack_from('<hh', uv1_data, i * 4)
-                vertexes[i].u1 = u_raw / 32768.0
-                vertexes[i].v1 = v_raw / 32768.0
+                vertexes[i].u1 = u_raw * uv_scale
+                vertexes[i].v1 = v_raw * uv_scale
+            # UV1 is the primary UV channel for RCRA models — copy to u/v
+            for i in range(min(len(vertexes), len(uv1_data) // 4)):
+                vertexes[i].u = vertexes[i].u1
+                vertexes[i].v = vertexes[i].v1
 
         # Vertex colours
         col_data = dat1.get_section(TAG_COLORS)
@@ -175,7 +183,8 @@ class ModelParser:
                 vertexes[i].r, vertexes[i].g, vertexes[i].b, vertexes[i].a = rgba
 
         # Parse Look section → assign lod_level to each MeshDefinition
-        lod_count = self._parse_look(dat1, meshes)
+        lod_count      = self._parse_look(dat1, meshes)
+        material_names = self._parse_material_names(dat1)
 
         return ModelAsset(
             vertexes          = vertexes,
@@ -188,21 +197,18 @@ class ModelParser:
             skin_data         = skin_data,
             skin_batches      = skin_batch,
             lod_count         = lod_count,
+            material_names    = material_names,
         )
 
     # ── Vertexes (section 0xA98BE69B) ─────────────────────────────────────────
 
-    def _parse_vertexes(self, dat1: DAT1) -> list[Vertex]:
+    def _parse_vertexes(self, dat1: DAT1, uv_scale: float) -> list[Vertex]:
         data = dat1.get_section(TAG_VERTEXES)
         if not data:
             return []
         vertexes = []
         SCALE = 1.0 / 4096.0
-
-        # UV scale from TAG_BUILT (0x283D0383) — confirmed from ALERT unknowns.py:
-        #   float at offset 0x30, reinterpreted as int, then:
-        #   uv_scale = (1 << (iuvscale & 0xF)) / 16384.0
-        UV_SCALE = self._read_uv_scale(dat1)
+        UV_SCALE = uv_scale
 
         for i in range(0, len(data) - 15, 16):
             X, Y, Z, _W, NXYZ, U, V = struct.unpack_from('<4hI2h', data, i)
@@ -219,26 +225,25 @@ class ModelParser:
         """
         Read the UV scale from TAG_BUILT section (0x283D0383).
         Formula confirmed from ALERT dat1lib/types/sections/model/unknowns.py:
-          values = array of float32 at every 4 bytes
-          float_val = values[0x30 // 4]  (float at byte offset 0x30)
+          float_val = float32 at byte offset 0x30
           iuvscale  = reinterpret float bits as int32
           uv_scale  = (1 << (iuvscale & 0xF)) / 16384.0
-        Default fallback: 1/32768.0 (= scale of 1, i.e. 2^0 / 16384 * 2)
+
+        This scale is applied directly to raw UV int16 values (both base vertex
+        and UV1 section) to get final UV coordinates.
+        Default fallback: 1/16384.0 (nibble=0, i.e. (1<<0)/16384)
         """
         try:
             built = dat1.get_section(TAG_BUILT)
             if not built or len(built) < 0x34:
-                return 1.0 / 32768.0
-            # Read float at offset 0x30
+                return 1.0 / 16384.0
             float_val = struct.unpack_from('<f', built, 0x30)[0]
-            # Reinterpret float bits as int32
             iuvscale = struct.unpack('<i', struct.pack('<f', float_val))[0]
             uv_scale = (1 << (iuvscale & 0xF)) / 16384.0
-            print(f"[mesh] UV scale: float={float_val} iuvscale={iuvscale} uv_scale={uv_scale:.8f} (1/{1/uv_scale:.1f})")
             return uv_scale
         except Exception as ex:
             print(f"[mesh] UV scale read failed: {ex}, using default")
-            return 1.0 / 32768.0
+            return 1.0 / 16384.0
 
     # ── Indexes (section 0x0859863D) ──────────────────────────────────────────
 
@@ -317,18 +322,37 @@ class ModelParser:
         n_looks = len(data) // LOOK_SIZE
         print(f"[mesh] Look section: {n_looks} looks, {LODS_PER_LOOK} LOD slots each")
 
-        # Parse look[0] (primary/default look) — assign lod_level to meshes
+        # Mark all meshes as belonging to no look initially (look_index = -1)
+        for m in meshes:
+            m.look_index = -1
+
+        # Parse all looks — assign look_index and lod_level to each mesh
+        for look_idx in range(n_looks):
+            look_off = look_idx * LOOK_SIZE
+            for lod_idx in range(LODS_PER_LOOK):
+                off = look_off + lod_idx * ENTRY_SIZE
+                start, count = struct.unpack_from('<HH', data, off)
+                if count == 0:
+                    continue
+                for mi in range(start, min(start + count, len(meshes))):
+                    # Only assign if not already claimed by an earlier look
+                    if meshes[mi].look_index == -1:
+                        meshes[mi].look_index = look_idx
+                        meshes[mi].lod_level  = lod_idx
+
+        # Meshes still unclaimed get look 0 / lod 0 as fallback
+        for m in meshes:
+            if m.look_index == -1:
+                m.look_index = 0
+
+        # Count active LODs in look[0]
         active_lods = 0
         for lod_idx in range(LODS_PER_LOOK):
             off = lod_idx * ENTRY_SIZE
             start, count = struct.unpack_from('<HH', data, off)
-            if count == 0:
-                continue   # unused LOD slot
-            active_lods = lod_idx + 1
-            for mi in range(start, min(start + count, len(meshes))):
-                meshes[mi].lod_level = lod_idx
+            if count > 0:
+                active_lods = lod_idx + 1
 
-        # Any meshes not covered by look[0] get lod_level 0 (fallback)
         print(f"[mesh] Look[0]: {active_lods} active LOD levels")
         return max(1, active_lods)
 
@@ -368,7 +392,7 @@ class ModelParser:
         for i in range(len(joints_data) // ENTRY_SIZE):
             base = i * ENTRY_SIZE
             parent, index, unk1, unk2, hash_val, str_off = struct.unpack_from('<hHHHII', joints_data, base)
-            name = self._read_string(dat1, str_off) or f"bone_{i}"
+            name = dat1.get_string(str_off) or f"bone_{i}"
             joints.append(JointDef(parent=parent, index=index, name=name, hash=hash_val))
 
         positions  = []
@@ -428,6 +452,41 @@ class ModelParser:
                 'first_vertex': first_vertex
             })
         return batches
+
+    # ── Material names (section 0x3250BB80) ──────────────────────────────────
+
+    def _parse_material_names(self, dat1: DAT1) -> list:
+        """
+        Parse material names from TAG_MATERIALS (0x3250BB80).
+
+        Format confirmed from the official Rift Apart importer (io_mesh_riftapart):
+          Each entry is two uint64 string offsets (16 bytes total):
+            uint64  path_string_offset  — full .material path
+            uint64  name_string_offset  — short display name
+          Only the first half of the section is read (MaterialInfoSize // 2).
+
+        mesh.material_index is a direct index into the resulting list.
+        """
+        data = dat1.get_section(TAG_MATERIALS)
+        if not data:
+            return []
+        data      = bytes(data)
+        half_size = len(data) // 2
+        names     = []
+        offset    = 0
+        while offset + 16 <= half_size:
+            path_off, = struct.unpack_from('<Q', data, offset)
+            name_off, = struct.unpack_from('<Q', data, offset + 8)
+            offset   += 16
+            name = dat1.get_string(name_off) or ''
+            if not name:
+                # Fallback: derive from path
+                path = dat1.get_string(path_off) or ''
+                name = path.replace('\\', '/').split('/')[-1]
+                if name.endswith('.material'):
+                    name = name[:-9]
+            names.append(name or f"material_{len(names)}")
+        return names
 
     # ── String table helper ───────────────────────────────────────────────────
 

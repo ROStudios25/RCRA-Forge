@@ -376,7 +376,7 @@ class Viewport3D(QOpenGLWidget):
         active_lod = getattr(self, '_active_lod', 0)
         gpu_iter = iter(self._gpu_meshes)
         for mesh in model.meshes:
-            if mesh.lod_level != active_lod:
+            if mesh.look_index != 0 or mesh.lod_level != active_lod:
                 continue
             gm = next(gpu_iter, None)
             if gm is None:
@@ -414,8 +414,8 @@ class Viewport3D(QOpenGLWidget):
         skipped = 0
 
         for i, mesh in enumerate(model.meshes):
-            # Filter by LOD level
-            if mesh.lod_level != active_lod:
+            # Filter by look 0 + LOD level — avoids bundled props from other looks
+            if mesh.look_index != 0 or mesh.lod_level != active_lod:
                 continue
             positions, normals, uvs, indices = mesh_to_numpy(model, mesh)
             if positions is None or indices is None or len(positions) == 0:
