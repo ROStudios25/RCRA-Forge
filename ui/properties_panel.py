@@ -202,7 +202,12 @@ class PropertiesPanel(QWidget):
         fmt_row.addWidget(QLabel("Format:"))
         self._fmt_combo = QComboBox()
         self._fmt_combo.setObjectName("FmtCombo")
-        self._fmt_combo.addItems(["GLB (Blender/glTF binary)", "GLTF (text + .bin)", "OBJ (Wavefront)"])
+        self._fmt_combo.addItems([
+            "GLB (Blender/glTF binary)",
+            "GLTF (text + .bin)",
+            "OBJ (Wavefront)",
+            "FBX (Binary, Maya/3ds Max/Blender)",
+        ])
         fmt_row.addWidget(self._fmt_combo)
         elayout.addLayout(fmt_row)
 
@@ -384,9 +389,14 @@ class PropertiesPanel(QWidget):
         if self._mesh_asset is None:
             return
 
-        fmt_map = {0: 'glb', 1: 'gltf', 2: 'obj'}
+        fmt_map = {0: 'glb', 1: 'gltf', 2: 'obj', 3: 'fbx'}
         fmt = fmt_map[self._fmt_combo.currentIndex()]
-        ext = f".{fmt}" if fmt in ('glb', 'obj') else ".gltf"
+        ext = {
+            'glb':  '.glb',
+            'gltf': '.gltf',
+            'obj':  '.obj',
+            'fbx':  '.fbx',
+        }[fmt]
 
         # Use asset name from browser if available, fall back to hex ID
         if self._asset_name:
@@ -419,6 +429,9 @@ class PropertiesPanel(QWidget):
                 GltfExporter(self._mesh_asset, stem, lod=lod).export_gltf(path)
             elif fmt == 'obj':
                 ObjExporter(self._mesh_asset, stem, lod=lod).export(path)
+            elif fmt == 'fbx':
+                from exporters.fbx_exporter import FbxExporter
+                FbxExporter(self._mesh_asset, stem, lod=lod).export(path)
             self._on_export_done(path)
         except Exception as ex:
             import traceback
