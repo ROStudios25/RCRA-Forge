@@ -54,8 +54,8 @@ call .venv\Scripts\activate.bat
 REM ── Install / upgrade dependencies ───────────────────────────────────────────
 echo.
 echo [2/5] Installing dependencies...
-pip install --upgrade pip -q
-pip install PyQt6 PyOpenGL PyOpenGL-accelerate numpy Pillow pyinstaller -q
+pip install --upgrade pip -q --disable-pip-version-check
+pip install PyQt6 PyOpenGL PyOpenGL-accelerate numpy Pillow imagecodecs pyinstaller -q
 if errorlevel 1 (
     echo [ERROR] pip install failed. Check your internet connection.
     pause & exit /b 1

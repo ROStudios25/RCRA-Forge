@@ -200,6 +200,8 @@ class GpuSubMesh:
         self.index_type: int = 0   # GL_UNSIGNED_SHORT or GL_UNSIGNED_INT
         self.color: tuple = (0.75, 0.75, 0.75)
         self.texture_id: int = 0   # OpenGL texture object, 0 = no texture
+        self.material_index: int = -1  # model material index for texture lookup
+        self.is_fur: bool = False     # fur/composite shell mesh — can be toggled
 
     def upload(self, positions: np.ndarray, normals: np.ndarray,
                uvs: np.ndarray, indices: np.ndarray):
@@ -282,6 +284,7 @@ class Viewport3D(QOpenGLWidget):
         self._mouse_mode:  str = 'orbit'
         self._dragging:    bool = False
         self._wireframe:   bool = False
+        self._show_fur:    bool = True    # toggle fur/composite shell meshes
         self._pending_model  = None
         self._redraw_pending = False
         self._grid_y         = 0.0
@@ -324,24 +327,17 @@ class Viewport3D(QOpenGLWidget):
 
     def load_textures(self, material_textures: dict):
         """
-        Upload albedo textures to GPU and assign to matching sub-meshes.
-        Caches the pixel data so textures survive LOD switches.
-
-        Parameters
-        ----------
-        material_textures : dict
-            Maps material_index (int) → (rgba_bytes, width, height)
+        Queue albedo textures for GPU upload on the next paintGL call.
+        Always defers to paintGL so OpenGL calls happen on the main thread
+        with the GL context guaranteed active.
         """
+        if not material_textures:
+            return
+
         # Cache for re-application after LOD switches
         self._cached_material_textures = material_textures
-
-        if not _HAS_OPENGL or not self.isValid():
-            self._pending_textures = material_textures
-            self._trigger_repaint()
-            return
-        self.makeCurrent()
-        self._upload_textures(material_textures)
-        self.doneCurrent()
+        # Defer actual upload to paintGL (GL context must be on main thread)
+        self._pending_textures = material_textures
         self._trigger_repaint()
 
     def _upload_textures(self, material_textures: dict):
@@ -353,7 +349,7 @@ class Viewport3D(QOpenGLWidget):
             if not rgba_bytes or w == 0 or h == 0:
                 continue
             try:
-                tex_id = glGenTextures(1)
+                tex_id = int(glGenTextures(1))
                 glBindTexture(GL_TEXTURE_2D, tex_id)
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
@@ -369,20 +365,13 @@ class Viewport3D(QOpenGLWidget):
             except Exception as ex:
                 print(f"[viewport] texture upload failed mat={mat_idx}: {ex}")
 
-        # Assign textures to GpuSubMeshes by material_index
-        model = getattr(self, '_current_model', None)
-        if model is None:
-            return
-        active_lod = getattr(self, '_active_lod', 0)
-        gpu_iter = iter(self._gpu_meshes)
-        for mesh in model.meshes:
-            if mesh.look_index != 0 or mesh.lod_level != active_lod:
-                continue
-            gm = next(gpu_iter, None)
-            if gm is None:
-                break
-            if mesh.material_index in gl_tex_map:
-                gm.texture_id = gl_tex_map[mesh.material_index]
+        # Assign textures directly by stored material_index — no iterator sync needed
+        # First clear any stale texture IDs from previous upload
+        for gm in self._gpu_meshes:
+            gm.texture_id = 0
+        for gm in self._gpu_meshes:
+            if gm.material_index in gl_tex_map:
+                gm.texture_id = gl_tex_map[gm.material_index]
 
     def set_lod(self, lod_idx: int):
         """Switch the viewport to show a different LOD level."""
@@ -413,15 +402,32 @@ class Viewport3D(QOpenGLWidget):
         all_positions = []
         skipped = 0
 
+        # Fur/composite shell material name patterns
+        FUR_KEYWORDS = ('fur', 'compositeshell', 'composite_shell')
+
         for i, mesh in enumerate(model.meshes):
             # Filter by look 0 + LOD level — avoids bundled props from other looks
             if mesh.look_index != 0 or mesh.lod_level != active_lod:
                 continue
+
             positions, normals, uvs, indices = mesh_to_numpy(model, mesh)
             if positions is None or indices is None or len(positions) == 0:
                 skipped += 1
                 continue
             gpu = GpuSubMesh()
+            gpu.material_index = mesh.material_index
+
+            # Tag fur/shell meshes — they stay in GPU list but can be skipped at draw time
+            mat_name = ''
+            if model.material_names and mesh.material_index < len(model.material_names):
+                mat_name = model.material_names[mesh.material_index].lower()
+            gpu.is_fur = any(kw in mat_name for kw in FUR_KEYWORDS)
+            positions, normals, uvs, indices = mesh_to_numpy(model, mesh)
+            if positions is None or indices is None or len(positions) == 0:
+                skipped += 1
+                continue
+            gpu = GpuSubMesh()
+            gpu.material_index = mesh.material_index
             try:
                 gpu.upload(positions, normals, uvs, indices)
                 if gpu.vao == 0:
@@ -482,6 +488,11 @@ class Viewport3D(QOpenGLWidget):
 
     def set_wireframe(self, enabled: bool):
         self._wireframe = enabled
+        self._redraw()
+
+    def set_show_fur(self, enabled: bool):
+        """Toggle visibility of fur/composite shell meshes."""
+        self._show_fur = enabled
         self._redraw()
 
     # ── OpenGL Lifecycle ──────────────────────────────────────────────────────
@@ -571,6 +582,8 @@ class Viewport3D(QOpenGLWidget):
                 glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
 
             for gm in self._gpu_meshes:
+                if gm.is_fur and not self._show_fur:
+                    continue
                 has_tex = gm.texture_id > 0 and not self._wireframe
                 _set_uniform_bool(self._shader_prog, 'uHasTexture', has_tex)
                 _set_uniform_3f(self._shader_prog, 'uBaseColor', *gm.color)
@@ -631,9 +644,23 @@ class Viewport3D(QOpenGLWidget):
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _free_gpu_meshes(self):
+        # Collect unique texture IDs before freeing (multiple meshes may share a texture)
+        unique_tex_ids = set()
+        for gm in self._gpu_meshes:
+            if gm.texture_id:
+                unique_tex_ids.add(int(gm.texture_id))
+            gm.texture_id = 0  # prevent gm.free() from deleting it
+
         for gm in self._gpu_meshes:
             gm.free()
         self._gpu_meshes.clear()
+
+        # Now delete unique textures once each
+        if unique_tex_ids:
+            try:
+                glDeleteTextures(len(unique_tex_ids), list(unique_tex_ids))
+            except Exception:
+                pass
 
     def _build_grid(self, half_size: int = 10, spacing: float = 0.1):
         """Build a full-screen quad for the infinite grid fragment shader."""

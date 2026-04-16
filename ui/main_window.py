@@ -164,6 +164,7 @@ class AssetLoader(QObject):
                     self.skel_ready.emit(skel)
 
                 # Load materials and decode albedo textures
+                # Always emit materials_ready (even empty) so the thread quits cleanly
                 self._load_model_textures(model)
 
             elif atype == 'texture':
@@ -293,10 +294,14 @@ class AssetLoader(QObject):
 
             if result:
                 self.materials_ready.emit(result)
+            else:
+                # Always emit so the thread quits cleanly
+                self.materials_ready.emit({})
 
         except Exception as ex:
             import traceback
             print(f"[texload] error: {ex}\n{traceback.format_exc()}")
+            self.materials_ready.emit({})
 
 
 # ── Main Window ───────────────────────────────────────────────────────────────
@@ -926,9 +931,10 @@ class MainWindow(QMainWindow):
         self._asset_loader.raw_ready.connect(self._on_raw_ready)
         self._asset_loader.error.connect(self._on_asset_error)
 
-        for sig in (self._asset_loader.mesh_ready, self._asset_loader.texture_ready,
-                    self._asset_loader.skel_ready, self._asset_loader.level_ready,
-                    self._asset_loader.error):
+        # Quit thread only after materials_ready (texture loading is last step in run())
+        # Do NOT quit on mesh_ready — texture loading happens after it.
+        for sig in (self._asset_loader.materials_ready, self._asset_loader.texture_ready,
+                    self._asset_loader.level_ready, self._asset_loader.error):
             sig.connect(self._asset_thread.quit)
 
         self._asset_thread.start()
@@ -1004,7 +1010,7 @@ class MainWindow(QMainWindow):
 
     def _show_about(self):
         QMessageBox.about(self, "About RCRA Forge",
-            "<h3>RCRA Forge v0.5.1</h3>"
+            "<h3>RCRA Forge v0.5.2</h3>"
             "<p>Ratchet &amp; Clank: Rift Apart level editor and model exporter.</p>"
             "<p>Format reverse engineering credit:<br>"
             "&nbsp;• chaoticgd / <i>ripped_apart</i> (MIT)<br>"

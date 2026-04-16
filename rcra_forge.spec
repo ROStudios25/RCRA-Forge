@@ -16,6 +16,10 @@ block_cipher = None
 # Collect all PyQt6 plugins (needed for OpenGL, platform, styles)
 qt_hidden = collect_submodules('PyQt6')
 
+# Collect imagecodecs — has binary codec extensions that must be bundled
+imagecodecs_hidden = collect_submodules('imagecodecs')
+imagecodecs_datas  = collect_data_files('imagecodecs')
+
 a = Analysis(
     ['main.py'],
     pathex=['.'],
@@ -23,8 +27,12 @@ a = Analysis(
     datas=[
         # Include README so it's accessible from Help menu if desired
         ('README.md', '.'),
-    ],
+    ] + imagecodecs_datas,
     hiddenimports=[
+        # imagecodecs — texture decompression (BC1/BC7 etc.)
+        'imagecodecs',
+        'imagecodecs._imagecodecs',
+    ] + imagecodecs_hidden + [
         # PyQt6 internals
         'PyQt6.QtOpenGL',
         'PyQt6.QtOpenGLWidgets',
@@ -65,6 +73,10 @@ a = Analysis(
         'ui.hex_inspector',
         'exporters',
         'exporters.gltf_exporter',
+        'exporters.fbx_exporter',
+        'exporters.group_exporter',
+        'core.material',
+        'core.hashes',
     ] + qt_hidden,
     hookspath=['hooks'],
     hooksconfig={},

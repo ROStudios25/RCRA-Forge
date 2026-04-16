@@ -22,7 +22,7 @@ A standalone Python/PyQt6 desktop tool for browsing, previewing and exporting as
 - Smart search with multi-token AND filtering
 
 ## Requirements
-- Python 3.8+
+- Python 3.10+
 - PyQt6
 - PyOpenGL
 - numpy
@@ -32,9 +32,19 @@ A standalone Python/PyQt6 desktop tool for browsing, previewing and exporting as
 - `hashes.txt` from [Overstrike](https://github.com/Tkachov/overstrike)
 
 ## Usage
+
+**Option 1 — From source (double-click):**
 ```
-python main.py
+run.bat
 ```
+Auto-creates a virtual environment and installs all requirements on first run.
+
+**Option 2 — Standalone exe:**
+```
+build_windows.bat
+```
+Builds `dist\RCRA_Forge\RCRA_Forge.exe` using PyInstaller. No Python required on the end user's machine.
+
 Then click **Open Folder** and point it at your Rift Apart game directory (the folder containing `toc`).
 
 - **Single export:** Select any `.model` asset, then click **Export Asset** in the Properties panel. Supported formats: GLB, GLTF, OBJ, FBX.
@@ -51,12 +61,12 @@ All exports produce files ready for import into Blender, Maya, 3ds Max or Substa
 - `libdeflate.dll` is bundled and required for HD texture decompression
 - HD textures are loaded automatically when a model is selected
 - UV scaling is read per-model from the built section (`0x283D0383`) for correct texture mapping
-- Composite shell meshes (fur) are included in export — delete or hide in Blender if not needed, or replace with particle hair
+- Composite shell meshes (fur) are included in export — delete in Blender if not needed, or replace with particle hair
 
 ## Known Issues
 - Stitching textures not yet loading
-- Emissive channel not yet applied in viewport shader
-- Some sub-meshes (fur, gloves) may appear untextured in viewport
+- Emissive/glow channel not yet applied in viewport shader
+- Fur and composite shell materials have no albedo texture by design — delete in Blender after export if not needed
 - Models with no visible geometry may use bone-space vertices (skinning not yet applied in viewport)
 
 ## GitHub
@@ -65,6 +75,19 @@ https://github.com/ROStudios25/RCRA-Forge
 ---
 
 ## Changelog
+
+### v0.5.2
+- **Viewport texture display fixed** — HD albedo textures (2048×2048) now load and display correctly in the 3D viewport
+- Fixed: background thread was killed before texture loading completed (mesh_ready signal was incorrectly quitting the asset loader thread)
+- Fixed: OpenGL texture uploads now always happen on the main thread via paintGL
+- Fixed: `glGenTextures` return value cast to `int` (PyOpenGL returns numpy array, not integer)
+- Fixed: unique texture IDs tracked to prevent double-deletion on model reload
+- Fixed: `imagecodecs` added to PyInstaller spec — textures now work correctly in the standalone exe build
+- Fixed: `fbx_exporter`, `group_exporter`, `core.material` and `core.hashes` added to PyInstaller spec
+- Fixed: pip version check notice suppressed in `run.bat` and `build_windows.bat`
+- Added: `run.bat` — double-click launcher that auto-installs requirements on first run
+- Added: `requirements.txt`
+- Known limitations: emissive/glow textures not yet applied in viewport; fur and composite shell materials have no albedo by design
 
 ### v0.5.1
 - **FBX binary exporter fixed** — models now import at correct scale and without errors in Blender 4.x and 5.x, Maya, 3ds Max and Substance Painter
