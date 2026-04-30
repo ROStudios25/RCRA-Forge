@@ -110,6 +110,10 @@ class AssetBrowser(QWidget):
     asset_activated = pyqtSignal(object)   # AssetEntry
     # Emitted when user double-clicks a group (for batch export)
     group_activated = pyqtSignal(object)   # AssetGroup
+    # Emitted from right-click context menu
+    quick_export_requested  = pyqtSignal(object, str)  # (AssetEntry, fmt)
+    add_to_list_requested   = pyqtSignal(object)       # AssetEntry
+    remove_from_list_requested = pyqtSignal(object)    # AssetEntry
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -125,6 +129,7 @@ class AssetBrowser(QWidget):
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(200)
         self._debounce.timeout.connect(self._apply_filter)
+        self._export_list_ids: set = set()  # asset_ids currently in export list
         self._build_ui()
 
     def _build_ui(self):
@@ -194,6 +199,8 @@ class AssetBrowser(QWidget):
         self._tree.setAnimated(True)
         self._tree.setUniformRowHeights(True)
         self._tree.itemDoubleClicked.connect(self._on_double_click)
+        self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._on_context_menu)
         layout.addWidget(self._tree)
 
         # ── Status bar ────────────────────────────────────────────────────────
@@ -695,3 +702,56 @@ class AssetBrowser(QWidget):
         group = item.data(0, Qt.ItemDataRole.UserRole + 4)
         if group:
             self.group_activated.emit(group)
+
+    def _on_context_menu(self, pos):
+        """Show right-click context menu for asset items."""
+        from PyQt6.QtWidgets import QMenu
+        item = self._tree.itemAt(pos)
+        if item is None:
+            return
+        entry = item.data(0, Qt.ItemDataRole.UserRole)
+        if entry is None:
+            return
+
+        name = item.text(0)
+        in_list = entry.asset_id in self._export_list_ids
+
+        menu = QMenu(self)
+        menu.setObjectName("ContextMenu")
+
+        # ── Quick Export ──────────────────────────────────────────────────────
+        menu.addSection("Quick Export")
+        act_glb = menu.addAction("⬇  Export as GLB")
+        act_fbx = menu.addAction("⬇  Export as FBX")
+        act_obj = menu.addAction("⬇  Export as OBJ")
+
+        menu.addSeparator()
+
+        # ── Export List ───────────────────────────────────────────────────────
+        menu.addSection("Export List")
+        if in_list:
+            act_list = menu.addAction("✕  Remove from Export List")
+        else:
+            act_list = menu.addAction("＋  Add to Export List")
+
+        action = menu.exec(self._tree.viewport().mapToGlobal(pos))
+        if action is None:
+            return
+
+        if action == act_glb:
+            self.quick_export_requested.emit(entry, 'glb')
+        elif action == act_fbx:
+            self.quick_export_requested.emit(entry, 'fbx')
+        elif action == act_obj:
+            self.quick_export_requested.emit(entry, 'obj')
+        elif action == act_list:
+            if in_list:
+                self._export_list_ids.discard(entry.asset_id)
+                self.remove_from_list_requested.emit(entry)
+            else:
+                self._export_list_ids.add(entry.asset_id)
+                self.add_to_list_requested.emit(entry)
+
+    def mark_export_list(self, asset_ids: set):
+        """Update the tracked export list IDs (called from main window)."""
+        self._export_list_ids = set(asset_ids)

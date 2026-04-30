@@ -126,6 +126,7 @@ class GroupExporter:
                 skins.append(skin_copy)
 
             # Remap nodes
+            mesh_offset = len(meshes)   # must be captured before meshes are appended below
             part_node_map = {}  # old node idx → new node idx
             for ni, node in enumerate(part_doc.get('nodes', [])):
                 node_copy = dict(node)
@@ -133,13 +134,15 @@ class GroupExporter:
                 part_node_map[ni] = new_ni
                 nodes.append(node_copy)
 
-            # Fix up node children and skin references now that we have the map
+            # Fix up node children, mesh, and skin references now that we have the map
             for ni, node in enumerate(part_doc.get('nodes', [])):
                 new_ni = part_node_map[ni]
                 if 'children' in node:
                     nodes[new_ni]['children'] = [
                         part_node_map[c] for c in node['children']
                     ]
+                if 'mesh' in node:
+                    nodes[new_ni]['mesh'] = node['mesh'] + mesh_offset
                 if 'skin' in node:
                     nodes[new_ni]['skin'] = part_skin_map[node['skin']] if node['skin'] in part_skin_map else node['skin'] + skin_offset
 

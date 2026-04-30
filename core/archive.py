@@ -430,6 +430,26 @@ class TocParser:
         except Exception:
             return None
 
+    def find_entry_by_id_lo(self, asset_id_lo: int) -> Optional['AssetEntry']:
+        """
+        Find an AssetEntry by the low 32 bits of its asset ID.
+        Used when only the lower half of the CRC64 is known (e.g. from
+        material texture slot entries). Returns the first match, preferring
+        texture-type entries. Returns None if no match.
+        """
+        import numpy as np
+        try:
+            ids_arr = self.entries._ids[:len(self.entries)]
+            lo_arr  = (ids_arr & 0xFFFFFFFF).astype(np.uint64)
+            hits    = np.where(lo_arr == np.uint64(asset_id_lo & 0xFFFFFFFF))[0]
+            if len(hits) == 0:
+                return None
+            # Prefer the smallest match (SD entry) — HD is just raw pixel data
+            entries = sorted([self.entries[int(i)] for i in hits], key=lambda e: e.size)
+            return entries[0]
+        except Exception:
+            return None
+
     def find_all_entries(self, asset_id: int) -> list:
         """
         Find ALL AssetEntries with this asset ID (may be multiple — SD + HD spans).

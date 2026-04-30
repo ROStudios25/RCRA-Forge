@@ -149,12 +149,12 @@ class GltfExporter:
             self._nodes.append(node)
             mesh_node_indices.append(node_idx)
 
-        # Scene root: all mesh nodes + root bones
+        # Scene root: mesh nodes only.
+        # Bone nodes must NOT appear in scenes[].nodes — Blender renders any
+        # scene-level node without a mesh as a visible Icosphere empty.
+        # The skin reference on each mesh node is enough for Blender to
+        # resolve the skeleton; bone nodes just need to exist in nodes[].
         scene_nodes = list(mesh_node_indices)
-        if has_skeleton:
-            for i, joint in enumerate(self.model.joints):
-                if joint.parent == -1:
-                    scene_nodes.append(i)
 
         buf: dict = {"byteLength": len(self._bin)}
         if bin_uri: buf["uri"] = bin_uri

@@ -22,22 +22,21 @@ A standalone Python/PyQt6 desktop tool for browsing, previewing and exporting as
 - Smart search with multi-token AND filtering
 
 ## Requirements
-- Python 3.10+
-- PyQt6
-- PyOpenGL
-- numpy
-- Pillow
-- imagecodecs (`pip install imagecodecs`)
+- [Python 3.10+](https://python.org) — during install, check **"Add Python to PATH"**
 - Ratchet & Clank: Rift Apart (PC) installed via Steam
 - `hashes.txt` from [Overstrike](https://github.com/Tkachov/overstrike)
 
+Everything else (PyQt6, PyOpenGL, numpy, Pillow, imagecodecs) is installed automatically on first run.
+
 ## Usage
 
-**Option 1 — From source (double-click):**
+**Option 1 — From source (easiest, double-click):**
 ```
 run.bat
 ```
-Auto-creates a virtual environment and installs all requirements on first run.
+Automatically finds Python, creates a virtual environment, installs all dependencies, and launches the app. All of this only happens once — subsequent launches are instant.
+
+> **Troubleshooting:** If you see "Python not found" but Python IS installed, open a new terminal and run `py --version`. If that works, Python is installed but not in PATH — the script will handle this automatically on Windows 10/11 via the `py` launcher.
 
 **Option 2 — Standalone exe:**
 ```
@@ -75,6 +74,17 @@ https://github.com/ROStudios25/RCRA-Forge
 ---
 
 ## Changelog
+
+### v0.5.3
+- **Fix:** Group GLB export mesh index remapping — mesh index in nodes was never offset by `mesh_offset`, causing all parts in a group export to reference mesh 0 instead of their own geometry
+- **Fix:** `GroupExportWorker` now uses the shared `TocParser` instance instead of re-instantiating one per part — fixes wrong API calls (`read_asset`/`parse_model_asset` → `extract_asset`/`ModelParser`) and removes significant per-part overhead
+- **Fix:** Export List now uses the shared `_toc_parser` directly instead of constructing a new `TocParser` on every export
+- **Fix:** Stray `part_name = self.group.entries[i]` line removed — was overwriting the resolved display name with a raw entry object on every iteration
+- **Fix:** Skeleton root bones no longer added to `scenes[0].nodes` in GLB output — Blender was rendering each unparented bone as a visible Icosphere empty in the scene
+- **Fix:** `run.bat` now tries `py` → `python3` → `python` in order — users with Python 3.10+ installed via the Windows Python Launcher (common on 3.12+/3.14) no longer see a false "Python not found" error
+- **Fix:** Texture albedo slot fallback — materials with non-standard path suffixes now fall back to `asset_id_lo` stored in the slot for direct TOC lookup, rather than silently showing nothing
+- **New:** `rcra_empties_to_collections.py` — Blender utility script to reorganise a group GLB import: converts top-level empties into Collections and moves mesh children in
+- **Known issue (WIP):** Some bangle materials (e.g. rebellion boots) still show no texture in viewport — `asset_id_lo` fallback is in place, root cause under investigation
 
 ### v0.5.2
 - **Viewport texture display fixed** — HD albedo textures (2048×2048) now load and display correctly in the 3D viewport

@@ -71,6 +71,15 @@ _SUFFIX_ROLES = {
     '_v':  'detail',
     '_d':  'detail_normal',
     '_ao': 'ambient_occlusion',
+    # Less common suffixes seen in some RCRA materials:
+    '_basecolor': 'albedo',
+    '_diffuse':   'albedo',
+    '_alb':       'albedo',
+    '_col':       'color',
+    '_nrm':       'normal',
+    '_nor':       'normal',
+    '_h':         'unknown',   # height/displacement — not albedo
+    '_e':         'unknown',   # emissive mask variants
 }
 
 
@@ -108,10 +117,20 @@ class MaterialAsset:
 
     @property
     def albedo_slot(self) -> Optional['TextureSlot']:
+        # Priority 1: known albedo roles (_g, _c suffix)
         for s in self.slots:
             if s.role in ('albedo', 'color'):
                 return s
-        return None
+        # Priority 2: first slot that isn't a normal/AO/specular/detail map.
+        # RCRA materials almost always put the base color first. Some materials
+        # (e.g. rebellion boots) use non-standard path suffixes that don't match
+        # _g or _c, so we'd otherwise return None and show nothing.
+        _non_albedo = {'normal', 'ao_emission', 'specular', 'detail', 'detail_normal', 'ambient_occlusion'}
+        for s in self.slots:
+            if s.role not in _non_albedo:
+                return s
+        # Last resort: slot 0 regardless of role
+        return self.slots[0] if self.slots else None
 
     @property
     def normal_slot(self) -> Optional['TextureSlot']:

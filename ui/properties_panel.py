@@ -55,32 +55,29 @@ class GroupExportWorker(QObject):
     finished = pyqtSignal(str)    # output path on success
     error    = pyqtSignal(str)    # error message
 
-    def __init__(self, group, archive_path: str, path: str):
+    def __init__(self, group, toc_parser, path: str):
         """
         Parameters
         ----------
-        group        : AssetGroup  (from core.grouping)
-        archive_path : str         path to the game 'toc' file (to open WADs)
-        path         : str         output .glb path
+        group      : AssetGroup  (from core.grouping)
+        toc_parser : TocParser   already-parsed TOC (shared, do not re-parse)
+        path       : str         output .glb path
         """
         super().__init__()
-        self.group        = group
-        self.archive_path = archive_path
-        self.path         = path
+        self.group      = group
+        self.toc_parser = toc_parser
+        self.path       = path
 
     def run(self):
         try:
             from exporters.group_exporter import GroupExporter
-            from core.mesh import parse_model_asset
-            from core.archive import TocParser
+            from core.mesh import ModelParser
 
             exporter = GroupExporter(slug=self.group.slug.rsplit('/', 1)[-1])
             n = len(self.group.entries)
 
             for i, entry in enumerate(self.group.entries):
-                part_name = self.group.entries[i]
                 # Derive part name from the asset id / path
-                # We'll use a simple index-based name if lookup not available
                 try:
                     from core.hashes import get_lookup
                     lk = get_lookup()
@@ -95,10 +92,8 @@ class GroupExportWorker(QObject):
                 self.progress.emit(f"Loading part {i+1}/{n}: {part_name}…")
 
                 try:
-                    # Read raw bytes from the WAD archive
-                    parser = TocParser(self.archive_path)
-                    raw = parser.read_asset(entry)
-                    model = parse_model_asset(raw, entry.header)
+                    raw = self.toc_parser.extract_asset(entry)
+                    model = ModelParser(raw).parse()
                     exporter.add_model(model, part_name)
                 except Exception as ex:
                     self.progress.emit(f"  ⚠ Skipped {part_name}: {ex}")
@@ -125,6 +120,7 @@ class PropertiesPanel(QWidget):
         self._mesh_asset             = None
         self._group                  = None   # AssetGroup for batch export
         self._archive_path: str      = None   # path to game 'toc' file
+        self._toc_parser             = None   # shared TocParser (set after TOC load)
         self._export_thread: QThread = None
         self._export_worker          = None   # keeps ExportWorker alive during thread run
         self._build_ui()
@@ -265,6 +261,51 @@ class PropertiesPanel(QWidget):
         elayout.addWidget(self._export_status)
 
         layout.addWidget(exp_group)
+
+        # ── Export List ────────────────────────────────────────────────────────
+        list_group = QGroupBox("Export List")
+        list_group.setObjectName("PropsGroup")
+        llayout = QVBoxLayout(list_group)
+        llayout.setContentsMargins(8, 12, 8, 8)
+        llayout.setSpacing(4)
+
+        list_hint = QLabel("Right-click any asset to add it here.")
+        list_hint.setObjectName("FieldValue")
+        list_hint.setWordWrap(True)
+        llayout.addWidget(list_hint)
+
+        from PyQt6.QtWidgets import QListWidget
+        self._export_list_widget = QListWidget()
+        self._export_list_widget.setObjectName("ExportListWidget")
+        self._export_list_widget.setMaximumHeight(120)
+        self._export_list_widget.setToolTip("Assets queued for combined GLB export.\nRight-click an asset in the browser to add or remove.")
+        llayout.addWidget(self._export_list_widget)
+
+        list_btn_row = QHBoxLayout()
+        self._btn_clear_list = QPushButton("Clear List")
+        self._btn_clear_list.setObjectName("SmallBtn")
+        self._btn_clear_list.setEnabled(False)
+        self._btn_clear_list.clicked.connect(self._do_clear_export_list)
+        list_btn_row.addWidget(self._btn_clear_list)
+        list_btn_row.addStretch()
+        llayout.addLayout(list_btn_row)
+
+        self._btn_export_list = QPushButton("⬇  Export List as GLB")
+        self._btn_export_list.setObjectName("ExportBtn")
+        self._btn_export_list.setEnabled(False)
+        self._btn_export_list.setToolTip(
+            "Export all queued assets into a single GLB.\n"
+            "Each asset becomes a named node under a shared root."
+        )
+        self._btn_export_list.clicked.connect(self._do_export_list)
+        llayout.addWidget(self._btn_export_list)
+
+        self._list_status = QLabel("")
+        self._list_status.setObjectName("ExportStatus")
+        self._list_status.setWordWrap(True)
+        llayout.addWidget(self._list_status)
+
+        layout.addWidget(list_group)
         layout.addStretch()
 
         # ── Log / notes ────────────────────────────────────────────────────
@@ -325,8 +366,56 @@ class PropertiesPanel(QWidget):
         self._lod_combo.blockSignals(False)
 
     def set_archive_path(self, path: str):
-        """Store the loaded toc path so group export can open WADs."""
+        """Store the loaded toc path (kept for legacy callers)."""
         self._archive_path = path
+
+    def set_toc_parser(self, parser, path: str):
+        """Store the shared TocParser and toc path after TOC load."""
+        self._toc_parser   = parser
+        self._archive_path = path
+
+    def add_to_export_list(self, entry, name: str = None):
+        """Add an asset entry to the export list panel."""
+        # Check for duplicates
+        for i in range(self._export_list_widget.count()):
+            item = self._export_list_widget.item(i)
+            if item.data(Qt.ItemDataRole.UserRole).asset_id == entry.asset_id:
+                return  # already in list
+        from PyQt6.QtWidgets import QListWidgetItem
+        display = name or f"{entry.asset_id:016X}"
+        item = QListWidgetItem(display)
+        item.setData(Qt.ItemDataRole.UserRole, entry)
+        item.setToolTip(f"ID: {entry.asset_id:#018x}")
+        self._export_list_widget.addItem(item)
+        self._btn_clear_list.setEnabled(True)
+        self._btn_export_list.setEnabled(True)
+        self._list_status.setText(f"{self._export_list_widget.count()} asset(s) queued")
+
+    def remove_from_export_list(self, entry):
+        """Remove an asset entry from the export list panel."""
+        for i in range(self._export_list_widget.count()):
+            item = self._export_list_widget.item(i)
+            if item.data(Qt.ItemDataRole.UserRole).asset_id == entry.asset_id:
+                self._export_list_widget.takeItem(i)
+                break
+        count = self._export_list_widget.count()
+        self._btn_clear_list.setEnabled(count > 0)
+        self._btn_export_list.setEnabled(count > 0)
+        self._list_status.setText(f"{count} asset(s) queued" if count > 0 else "")
+
+    def get_export_list_entries(self):
+        """Return all AssetEntry objects currently in the export list."""
+        return [
+            self._export_list_widget.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(self._export_list_widget.count())
+        ]
+
+    def clear_export_list(self):
+        """Clear the export list programmatically."""
+        self._export_list_widget.clear()
+        self._btn_clear_list.setEnabled(False)
+        self._btn_export_list.setEnabled(False)
+        self._list_status.setText("")
 
     def set_group(self, group):
         """Populate the group export section with *group* info."""
@@ -348,6 +437,71 @@ class PropertiesPanel(QWidget):
     def _on_lod_changed(self, index: int):
         self.lod_changed.emit(index)
 
+    def _do_clear_export_list(self):
+        self.clear_export_list()
+
+    def _do_export_list(self):
+        entries = self.get_export_list_entries()
+        if not entries:
+            return
+        if not self._archive_path:
+            self._list_status.setText("✗ No archive loaded — open a game folder first")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export List as GLB", "export_list.glb",
+            "GLB Files (*.glb);;All Files (*.*)"
+        )
+        if not path:
+            return
+
+        self._btn_export_list.setEnabled(False)
+        self._btn_clear_list.setEnabled(False)
+        self._list_status.setText("Exporting…")
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents()
+
+        try:
+            from core.archive import TocParser
+            from core.mesh import ModelParser
+            from exporters.group_exporter import GroupExporter
+
+            # Use parse() to properly read the TOC file before extracting assets
+            toc = TocParser(self._archive_path)
+            toc.parse()
+
+            exporter = GroupExporter()
+            for entry in entries:
+                try:
+                    raw = toc.extract_asset(entry)
+                    model = ModelParser(raw).parse()
+                    name = f"asset_{entry.asset_id:016X}"
+                    # Try to get a display name from the list widget
+                    for i in range(self._export_list_widget.count()):
+                        item = self._export_list_widget.item(i)
+                        if item.data(Qt.ItemDataRole.UserRole).asset_id == entry.asset_id:
+                            name = item.text().rsplit('.', 1)[0]
+                            break
+                    exporter.add_model(model, name)
+                except Exception as ex:
+                    self._list_status.setText(f"✗ Failed on {entry.asset_id:#018x}: {ex}")
+                    self._btn_export_list.setEnabled(True)
+                    self._btn_clear_list.setEnabled(True)
+                    return
+
+            exporter.export_glb(path)
+            import os
+            self._list_status.setText(f"✓ Exported → {os.path.basename(path)}")
+            self.log(f"[LIST OK] {path}")
+
+        except Exception as ex:
+            import traceback
+            self._list_status.setText(f"✗ Export failed: {ex}")
+            self.log(f"[LIST ERROR] {ex}\n{traceback.format_exc()}")
+        finally:
+            self._btn_export_list.setEnabled(True)
+            self._btn_clear_list.setEnabled(self._export_list_widget.count() > 0)
+
     def _do_export_group(self):
         if not self._group:
             return
@@ -368,7 +522,7 @@ class PropertiesPanel(QWidget):
         self._export_status.setText("Starting group export…")
 
         self._export_thread = QThread(self)
-        worker = GroupExportWorker(self._group, self._archive_path, path)
+        worker = GroupExportWorker(self._group, self._toc_parser, path)
         worker.moveToThread(self._export_thread)
         self._export_thread.started.connect(worker.run)
         worker.progress.connect(self._export_status.setText)

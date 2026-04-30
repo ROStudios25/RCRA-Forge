@@ -260,11 +260,22 @@ class AssetLoader(QObject):
                     tex_id = lookup.asset_id(tex_path)
                     if tex_id is None:
                         tex_id = lookup.asset_id(tex_path.lstrip('/'))
-                    if tex_id is None:
-                        print(f"[texload] mat[{mat_idx}] texture not found: {tex_path}")
-                        continue
-                    tex_entry = self.toc_parser.find_entry(tex_id)
+
+                    tex_entry = None
+                    if tex_id is not None:
+                        tex_entry = self.toc_parser.find_entry(tex_id)
+
+                    # Fallback: use the asset_id_lo stored in the slot directly.
+                    # This works even when the path in hashes.txt doesn't match
+                    # what the material stores (e.g. rebellion boots, some bangles).
+                    if tex_entry is None and albedo.asset_id_lo:
+                        tex_entry = self.toc_parser.find_entry_by_id_lo(albedo.asset_id_lo)
+                        if tex_entry is not None:
+                            print(f"[texload] mat[{mat_idx}] path lookup failed for '{tex_path}', "
+                                  f"found via id_lo={albedo.asset_id_lo:#010x}")
+
                     if tex_entry is None:
+                        print(f"[texload] mat[{mat_idx}] texture not found: {tex_path}")
                         continue
                     tex_data = self.toc_parser.extract_asset(tex_entry)
                     tex = TextureParser(tex_data).parse()
@@ -341,6 +352,9 @@ class MainWindow(QMainWindow):
         self._browser.setMinimumWidth(180)
         self._browser.asset_activated.connect(self._on_asset_activated)
         self._browser.group_activated.connect(self._on_group_activated)
+        self._browser.quick_export_requested.connect(self._on_quick_export)
+        self._browser.add_to_list_requested.connect(self._on_add_to_export_list)
+        self._browser.remove_from_list_requested.connect(self._on_remove_from_export_list)
         outer.addWidget(self._browser)
 
         # ── Right side: vertical split [Viewport top | Tabs bottom] ──────────
@@ -880,7 +894,7 @@ class MainWindow(QMainWindow):
         elapsed_wall = time.time() - getattr(self, '_toc_load_start', 0)
         self._toc_parser = parser
         self._progress.setVisible(False)
-        self._props.set_archive_path(self._toc_path)
+        self._props.set_toc_parser(parser, self._toc_path)
         t1 = time.perf_counter()
         self._browser.load_entries_grouped(entries, groups, None)
         t2 = time.perf_counter()
@@ -948,6 +962,73 @@ class MainWindow(QMainWindow):
             f"click 'Export Group as GLB' in Properties to export"
         )
 
+    def _on_quick_export(self, entry, fmt: str):
+        """Handle right-click quick export from asset browser."""
+        from PyQt6.QtWidgets import QFileDialog
+        import os
+
+        # Get asset name for filename
+        lookup = self._browser._lookup
+        name = None
+        if lookup and lookup.is_loaded():
+            name = lookup.name(entry.asset_id)
+        stem = (name or f"asset_{entry.asset_id:016X}").rsplit('.', 1)[0]
+
+        ext_map = {'glb': 'GLB Files (*.glb)', 'fbx': 'FBX Files (*.fbx)', 'obj': 'OBJ Files (*.obj)'}
+        path, _ = QFileDialog.getSaveFileName(
+            self, f"Export as {fmt.upper()}", f"{stem}.{fmt}",
+            f"{ext_map.get(fmt, 'All Files (*.*)')};;All Files (*.*)"
+        )
+        if not path:
+            return
+
+        if not self._toc_path:
+            self._status_lbl.setText("✗ No game folder loaded")
+            return
+
+        try:
+            from core.archive import TocParser
+            from core.mesh import ModelParser
+
+            toc = TocParser(self._toc_path)
+            toc.parse()
+            raw = toc.extract_asset(entry)
+            model = ModelParser(raw).parse()
+
+            if fmt == 'glb':
+                from exporters.gltf_exporter import GltfExporter
+                GltfExporter(model, name=stem).export(path)
+            elif fmt == 'fbx':
+                from exporters.fbx_exporter import FbxExporter
+                FbxExporter(model, name=stem).export(path)
+            elif fmt == 'obj':
+                from exporters.gltf_exporter import ObjExporter
+                ObjExporter(model, name=stem).export(path)
+
+            self._status_lbl.setText(f"✓ Exported {stem}.{fmt}")
+        except Exception as ex:
+            import traceback
+            self._status_lbl.setText(f"✗ Export failed: {ex}")
+            print(f"[quick_export] error: {ex}\n{traceback.format_exc()}")
+
+    def _on_add_to_export_list(self, entry):
+        """Handle right-click add to export list from asset browser."""
+        lookup = self._browser._lookup
+        name = None
+        if lookup and lookup.is_loaded():
+            name = lookup.name(entry.asset_id)
+        self._props.add_to_export_list(entry, name=name)
+        self._browser.mark_export_list(
+            {e.asset_id for e in self._props.get_export_list_entries()}
+        )
+
+    def _on_remove_from_export_list(self, entry):
+        """Handle right-click remove from export list from asset browser."""
+        self._props.remove_from_export_list(entry)
+        self._browser.mark_export_list(
+            {e.asset_id for e in self._props.get_export_list_entries()}
+        )
+
     def _on_mesh_ready(self, model_asset):
         self._viewport.load_mesh(model_asset)
         self._props.set_mesh_asset(model_asset)
@@ -1010,7 +1091,7 @@ class MainWindow(QMainWindow):
 
     def _show_about(self):
         QMessageBox.about(self, "About RCRA Forge",
-            "<h3>RCRA Forge v0.5.2</h3>"
+            "<h3>RCRA Forge v0.5.3</h3>"
             "<p>Ratchet &amp; Clank: Rift Apart level editor and model exporter.</p>"
             "<p>Format reverse engineering credit:<br>"
             "&nbsp;• chaoticgd / <i>ripped_apart</i> (MIT)<br>"
