@@ -177,11 +177,11 @@ class GltfExporter:
     # ── Skeleton ──────────────────────────────────────────────────────────────
 
     def _compute_world_transforms(self):
-        joints  = self.model.joints
-        pos_arr = self.model.joint_positions
-        rot_arr = self.model.joint_quaternions
-        N       = len(joints)
-        world   = [None] * N
+        joints    = self.model.joints
+        pos_arr   = self.model.joint_positions
+        rot_arr   = self.model.joint_quaternions
+        N         = len(joints)
+        world     = [None] * N
 
         def compute(i):
             if world[i] is not None:

@@ -40,6 +40,9 @@ class ExportWorker(QObject):
                 GltfExporter(self.mesh, name, lod=self.lod).export_gltf(self.path)
             elif self.fmt == 'obj':
                 ObjExporter(self.mesh, name, lod=self.lod).export(self.path)
+            elif self.fmt == 'ascii':
+                from exporters.ascii_exporter import export_ascii
+                export_ascii(self.mesh, self.path, lod=self.lod)
             self.finished.emit(self.path)
         except Exception as ex:
             import traceback
@@ -203,6 +206,7 @@ class PropertiesPanel(QWidget):
             "GLTF (text + .bin)",
             "OBJ (Wavefront)",
             "FBX (Binary, Maya/3ds Max/Blender)",
+            "ASCII (ALERT re-import format)",
         ])
         fmt_row.addWidget(self._fmt_combo)
         elayout.addLayout(fmt_row)
@@ -543,13 +547,14 @@ class PropertiesPanel(QWidget):
         if self._mesh_asset is None:
             return
 
-        fmt_map = {0: 'glb', 1: 'gltf', 2: 'obj', 3: 'fbx'}
+        fmt_map = {0: 'glb', 1: 'gltf', 2: 'obj', 3: 'fbx', 4: 'ascii'}
         fmt = fmt_map[self._fmt_combo.currentIndex()]
         ext = {
-            'glb':  '.glb',
-            'gltf': '.gltf',
-            'obj':  '.obj',
-            'fbx':  '.fbx',
+            'glb':   '.glb',
+            'gltf':  '.gltf',
+            'obj':   '.obj',
+            'fbx':   '.fbx',
+            'ascii': '.ascii',
         }[fmt]
 
         # Use asset name from browser if available, fall back to hex ID
@@ -586,6 +591,9 @@ class PropertiesPanel(QWidget):
             elif fmt == 'fbx':
                 from exporters.fbx_exporter import FbxExporter
                 FbxExporter(self._mesh_asset, stem, lod=lod).export(path)
+            elif fmt == 'ascii':
+                from exporters.ascii_exporter import export_ascii
+                export_ascii(self._mesh_asset, path, lod=lod)
             self._on_export_done(path)
         except Exception as ex:
             import traceback

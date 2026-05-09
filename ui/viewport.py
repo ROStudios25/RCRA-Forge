@@ -15,6 +15,8 @@ from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtCore import Qt, QPoint
 from PyQt6.QtGui import QMouseEvent, QWheelEvent
 
+from ui.controls_dialog import load_controls
+
 try:
     from OpenGL.GL import *
     from OpenGL.GL.shaders import compileShader, compileProgram
@@ -57,6 +59,7 @@ in vec3 vWorldPos;
 in vec2 vUV;
 
 uniform vec3      uLightDir;
+uniform vec3      uFillDir;
 uniform vec3      uBaseColor;
 uniform bool      uWireframe;
 uniform bool      uHasTexture;
@@ -69,14 +72,18 @@ void main() {
         FragColor = vec4(0.2, 0.8, 1.0, 1.0);
         return;
     }
+    // Two-sided lighting: use abs(dot) so inverted normals still receive light.
+    // This handles cases where vertex normals point inward on some sub-meshes.
     vec3 n    = normalize(vNormal);
-    float NdL = max(dot(n, normalize(uLightDir)), 0.15);
+    float NdL  = abs(dot(n, normalize(uLightDir)));
+    float NdL2 = abs(dot(n, normalize(uFillDir)));
+    float light = NdL * 0.8 + NdL2 * 0.3 + 0.35;
     vec3 col;
     if (uHasTexture) {
         vec3 tex = texture(uAlbedo, vUV).rgb;
-        col = tex * NdL + tex * 0.3;
+        col = tex * light;
     } else {
-        col = uBaseColor * NdL + uBaseColor * 0.3;
+        col = uBaseColor * light;
     }
     FragColor = vec4(col, 1.0);
 }
@@ -85,7 +92,9 @@ void main() {
 GRID_VERT = """
 #version 330 core
 layout(location=0) in vec3 aPos;
+
 uniform mat4 uInvVP;
+
 out vec3 vNear;
 out vec3 vFar;
 
@@ -105,34 +114,52 @@ GRID_FRAG = """
 #version 330 core
 in vec3 vNear;
 in vec3 vFar;
+
 uniform float uGridY;
+uniform bool  uOrtho;
+uniform vec3  uEye;       // camera world-space eye position
+
 out vec4 FragColor;
 
 float gridLine(vec2 uv, float scale) {
-    vec2 grid = abs(fract(uv / scale - 0.5) - 0.5) / fwidth(uv / scale);
-    return min(grid.x, grid.y);
+    vec2 g = abs(fract(uv / scale - 0.5) - 0.5) / fwidth(uv / scale);
+    return min(g.x, g.y);
 }
 
 void main() {
-    // Intersect ray with Y=uGridY plane
-    float t = (uGridY - vNear.y) / (vFar.y - vNear.y);
-    if (t <= 0.0) discard;
+    vec3 rayOrigin, rayDir;
 
-    vec3 pos = vNear + t * (vFar - vNear);
-    float dist = length(pos - vNear);
+    if (uOrtho) {
+        // In ortho all rays are parallel. The direction is the same for every
+        // fragment: from near to far (both already in world space).
+        // The origin per-fragment is vNear — it lies on the near plane in
+        // world space at the correct XZ for this screen pixel.
+        rayDir    = normalize(vFar - vNear);
+        rayOrigin = vNear;
+    } else {
+        // Perspective: rays diverge from the eye point.
+        rayOrigin = uEye;
+        rayDir    = normalize(vFar - uEye);
+    }
 
-    // Two grid levels
-    float g1 = gridLine(pos.xz, 1.0);
-    float g2 = gridLine(pos.xz, 0.1);
+    float dY = rayDir.y;
+    if (abs(dY) < 1e-5) discard;
+
+    float t = (uGridY - rayOrigin.y) / dY;
+    if (t < 0.0) discard;
+
+    vec3  pos     = rayOrigin + t * rayDir;
+    float dist    = length(pos.xz - uEye.xz);
+
+    float g1   = gridLine(pos.xz, 1.0);
+    float g2   = gridLine(pos.xz, 0.1);
     float line = min(g1, g2);
 
-    float alpha = (1.0 - min(line, 1.0)) * (1.0 - smoothstep(0.0, 80.0, dist));
+    float fadeRange = uOrtho ? 200.0 : 80.0;
+    float alpha = (1.0 - min(line, 1.0)) * (1.0 - smoothstep(0.0, fadeRange, dist));
     if (alpha < 0.01) discard;
 
-    vec3 col = vec3(0.5, 0.55, 0.65);
-    // Brighter for major grid lines (every 1 unit)
-    if (g2 > g1) col = vec3(0.6, 0.65, 0.75);
-
+    vec3 col = (g2 > g1) ? vec3(0.6, 0.65, 0.75) : vec3(0.5, 0.55, 0.65);
     FragColor = vec4(col, alpha * 0.85);
 }
 """
@@ -290,6 +317,9 @@ class Viewport3D(QOpenGLWidget):
         self._grid_y         = 0.0
         self._grid_fade_r    = 2.0
         self._cached_material_textures: dict = {}   # persists across LOD switches
+        # Load persisted control settings
+        self._controls: dict = load_controls()
+
         self.setMinimumSize(400, 300)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.WheelFocus)
@@ -537,7 +567,17 @@ class Viewport3D(QOpenGLWidget):
 
         w, h = self.width(), self.height()
         aspect = w / max(h, 1)
-        proj   = _perspective(60.0, aspect, 0.01, 1000.0)
+        if getattr(self, '_ortho', False):
+            # Orthographic: scale half-height by camera distance.
+            # near/far are expressed in view space; we push near well behind
+            # the eye (negative) so the infinite grid is never clipped, while
+            # keeping far large enough for big scenes.
+            half_h = self.camera.dist * 0.5
+            extent = max(self.camera.dist * 10.0, 500.0)
+            proj   = _ortho(-half_h * aspect, half_h * aspect,
+                            -half_h, half_h, -extent, extent)
+        else:
+            proj   = _perspective(60.0, aspect, 0.01, 1000.0)
         view   = self.camera.view_matrix()
         vp     = proj @ view
         model  = np.eye(4, dtype=np.float32)
@@ -546,13 +586,17 @@ class Viewport3D(QOpenGLWidget):
 
         light_dir = np.array([0.6, 1.0, 0.8], np.float32)
         light_dir /= np.linalg.norm(light_dir)
+        fill_dir  = np.array([0.0, 0.3, 1.0], np.float32)   # soft front fill
+        fill_dir  /= np.linalg.norm(fill_dir)
 
-        # Draw infinite grid using full-screen quad + fragment shader
+        # Draw infinite grid using full-screen quad + fragment shader.
         glDisable(GL_DEPTH_TEST)
         glUseProgram(self._grid_prog)
-        # Pass inverse VP so shader can reconstruct world rays
         inv_vp = np.linalg.inv(vp).astype(np.float32)
         _set_uniform_mat4(self._grid_prog, 'uInvVP', inv_vp)
+        _set_uniform_bool(self._grid_prog, 'uOrtho', getattr(self, '_ortho', False))
+        eye = self.camera.eye_position()
+        _set_uniform_3f(self._grid_prog, 'uEye', float(eye[0]), float(eye[1]), float(eye[2]))
         grid_y = getattr(self, '_grid_y', 0.0)
         loc = glGetUniformLocation(self._grid_prog, 'uGridY')
         if loc >= 0: glUniform1f(loc, grid_y)
@@ -569,6 +613,7 @@ class Viewport3D(QOpenGLWidget):
             _set_uniform_mat4(self._shader_prog, 'uModel', model)
             _set_uniform_mat3(self._shader_prog, 'uNormal', normal_mat)
             _set_uniform_3f(self._shader_prog, 'uLightDir', *light_dir)
+            _set_uniform_3f(self._shader_prog, 'uFillDir',  *fill_dir)
             _set_uniform_bool(self._shader_prog, 'uWireframe', self._wireframe)
 
             # Bind texture sampler to unit 0
@@ -596,30 +641,75 @@ class Viewport3D(QOpenGLWidget):
 
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
 
-    # ── Mouse Input ───────────────────────────────────────────────────────────
+    # ── Control settings ──────────────────────────────────────────────────────
+
+    def reload_controls(self):
+        """Re-read persisted control settings (call after the dialog closes)."""
+        self._controls = load_controls()
+
+    # ── Mouse Input  (Blender-style) ──────────────────────────────────────────
+    #
+    #   LMB drag            → Orbit
+    #   MMB drag            → Pan
+    #   Shift + MMB drag    → Pan
+    #   Ctrl  + MMB drag    → Zoom (vertical drag)
+    #   Scroll wheel        → Zoom
+    #
 
     def mousePressEvent(self, e: QMouseEvent):
         self.setFocus()
-        self._last_pos   = e.pos()
-        self._dragging   = True
-        if e.buttons() & Qt.MouseButton.RightButton:
-            self._mouse_mode = 'pan'
+        self._last_pos = e.pos()
+        self._dragging = True
+
+        mods = e.modifiers()
+        btn  = e.button()
+
+        LMB = Qt.MouseButton.LeftButton
+        MMB = Qt.MouseButton.MiddleButton
+
+        if btn == MMB:
+            if mods & Qt.KeyboardModifier.ControlModifier:
+                self._mouse_mode = 'zoom_drag'
+            else:
+                # Shift+MMB and plain MMB both pan
+                self._mouse_mode = 'pan'
+        elif btn == LMB:
+            self._mouse_mode = 'orbit'
         else:
             self._mouse_mode = 'orbit'
+
         self._start_render_loop()
 
     def mouseMoveEvent(self, e: QMouseEvent):
         if not self._dragging or self._last_pos is None:
             return
-        if not e.buttons():
+
+        held = e.buttons()
+        LMB  = Qt.MouseButton.LeftButton
+        MMB  = Qt.MouseButton.MiddleButton
+
+        if not (held & LMB) and not (held & MMB):
             self._dragging = False
             return
-        dx = e.pos().x() - self._last_pos.x()
-        dy = e.pos().y() - self._last_pos.y()
+
+        raw_dx = e.pos().x() - self._last_pos.x()
+        raw_dy = e.pos().y() - self._last_pos.y()
+
         if self._mouse_mode == 'orbit':
+            inv_x = self._controls.get("invert_orbit_x", False)
+            inv_y = self._controls.get("invert_orbit_y", False)
+            dx = -raw_dx if inv_x else raw_dx
+            dy = -raw_dy if inv_y else raw_dy
             self.camera.orbit(dx, dy)
-        else:
-            self.camera.pan(dx, dy)
+
+        elif self._mouse_mode == 'pan':
+            self.camera.pan(raw_dx, raw_dy)
+
+        elif self._mouse_mode == 'zoom_drag':
+            # Ctrl+MMB vertical drag: drag down = zoom in (positive delta)
+            speed = float(self._controls.get("zoom_speed", 1.0))
+            self.camera.zoom(-raw_dy * 0.02 * speed)
+
         self._last_pos = e.pos()
         try:
             win = self.window()
@@ -637,8 +727,38 @@ class Viewport3D(QOpenGLWidget):
         self.update()
 
     def wheelEvent(self, e: QWheelEvent):
-        delta = e.angleDelta().y() / 120.0
-        self.camera.zoom(-delta)
+        raw_delta = e.angleDelta().y() / 120.0   # +1 = scroll up = zoom in
+        speed     = float(self._controls.get("zoom_speed", 1.0))
+        invert    = self._controls.get("invert_zoom", False)
+        signed    = raw_delta if not invert else -raw_delta
+        self.camera.zoom(signed * speed)
+        self._redraw()
+
+    # ── Keyboard Input (Blender numpad presets) ───────────────────────────────
+
+    def keyPressEvent(self, e):
+        key = e.key()
+        K   = Qt.Key
+
+        numpad_presets = {
+            K.Key_1:        'front',
+            K.Key_3:        'right',
+            K.Key_7:        'top',
+            K.Key_9:        'back',   # Blender: Ctrl+Num1 = back; Num9 is close enough
+        }
+
+        if key in numpad_presets:
+            self.set_view_preset(numpad_presets[key])
+        elif key == K.Key_5:
+            self._toggle_ortho()
+        elif key == K.Key_F:
+            self.frame_model()
+        else:
+            super().keyPressEvent(e)
+
+    def _toggle_ortho(self):
+        """Toggle between perspective and orthographic projection."""
+        self._ortho = not getattr(self, '_ortho', False)
         self._redraw()
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -689,6 +809,15 @@ def _perspective(fov_deg: float, aspect: float, near: float, far: float) -> np.n
         [0,        f,  0,                        0                       ],
         [0,        0,  (far+near)/(near-far),    (2*far*near)/(near-far) ],
         [0,        0, -1,                        0                       ]
+    ], dtype=np.float32)
+
+def _ortho(left: float, right: float, bottom: float, top: float,
+           near: float, far: float) -> np.ndarray:
+    return np.array([
+        [2/(right-left), 0,              0,             -(right+left)/(right-left)],
+        [0,              2/(top-bottom), 0,             -(top+bottom)/(top-bottom)],
+        [0,              0,             -2/(far-near),  -(far+near)/(far-near)    ],
+        [0,              0,              0,              1                        ],
     ], dtype=np.float32)
 
 def _look_at(eye: np.ndarray, center: np.ndarray, up: np.ndarray) -> np.ndarray:

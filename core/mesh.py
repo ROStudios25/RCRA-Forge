@@ -129,6 +129,7 @@ class ModelAsset:
     # joint transforms: list of (scale3, quat4, pos3) from matrixes34
     joint_positions:  list[tuple] = field(default_factory=list)
     joint_quaternions: list[tuple] = field(default_factory=list)
+    joint_scales:     list[tuple] = field(default_factory=list)   # per-bone scale from m34[0:3]
     rcra_weights:     list         = field(default_factory=list)  # per-vertex list of (bone, weight) pairs
     lod_count:        int          = 1    # number of LOD levels detected from Look section
     skin_data:        Optional[bytes] = None
@@ -157,7 +158,7 @@ class ModelParser:
         vertexes   = self._parse_vertexes(dat1, uv_scale)
         indexes    = self._parse_indexes(dat1)
         meshes     = self._parse_meshes(dat1)
-        joints, jpos, jquat = self._parse_joints(dat1)
+        joints, jpos, jquat, jscales = self._parse_joints(dat1)
         rcra_w     = self._parse_rcra_weights(dat1)
         skin_data  = dat1.get_section(TAG_SKIN_DATA)
         skin_batch = self._parse_skin_batches(dat1)
@@ -193,6 +194,7 @@ class ModelParser:
             joints            = joints,
             joint_positions   = jpos,
             joint_quaternions = jquat,
+            joint_scales      = jscales,
             rcra_weights      = rcra_w,
             skin_data         = skin_data,
             skin_batches      = skin_batch,
@@ -322,12 +324,15 @@ class ModelParser:
         n_looks = len(data) // LOOK_SIZE
         print(f"[mesh] Look section: {n_looks} looks, {LODS_PER_LOOK} LOD slots each")
 
-        # Mark all meshes as belonging to no look initially (look_index = -1)
+        # Mark all meshes as unassigned initially
         for m in meshes:
             m.look_index = -1
+            m.lod_level  = 0
 
-        # Parse all looks — assign look_index and lod_level to each mesh
-        for look_idx in range(n_looks):
+        # Process looks in reverse order so look[0] always wins (overwrites later looks).
+        # This handles the case where multiple looks reference the same mesh indices —
+        # e.g. bangle models where look[0] and look[1] are identical.
+        for look_idx in range(n_looks - 1, -1, -1):
             look_off = look_idx * LOOK_SIZE
             for lod_idx in range(LODS_PER_LOOK):
                 off = look_off + lod_idx * ENTRY_SIZE
@@ -335,10 +340,8 @@ class ModelParser:
                 if count == 0:
                     continue
                 for mi in range(start, min(start + count, len(meshes))):
-                    # Only assign if not already claimed by an earlier look
-                    if meshes[mi].look_index == -1:
-                        meshes[mi].look_index = look_idx
-                        meshes[mi].lod_level  = lod_idx
+                    meshes[mi].look_index = look_idx
+                    meshes[mi].lod_level  = lod_idx
 
         # Meshes still unclaimed get look 0 / lod 0 as fallback
         for m in meshes:
@@ -397,6 +400,7 @@ class ModelParser:
 
         positions  = []
         quaternions = []
+        scales      = []
         if xform_data:
             # Each entry: 12 floats (3×4 matrix) + 16 floats (4×4 matrix)
             ENTRY1 = 12 * 4   # 48B
@@ -405,6 +409,7 @@ class ModelParser:
             for i in range(count):
                 m34 = struct.unpack_from('<12f', xform_data, i * ENTRY1)
                 # scale = m34[0:3], quaternion = m34[4:8], position = m34[8:11]
+                scales.append(m34[0:3])
                 positions.append(m34[8:11])
                 quaternions.append(m34[4:8])
 
@@ -414,7 +419,7 @@ class ModelParser:
             if align != 0:
                 off44 += ENTRY2 - align
 
-        return joints, positions, quaternions
+        return joints, positions, quaternions, scales
 
     # ── RCRA skin weights (section 0xCCBAFF15) ────────────────────────────────
 

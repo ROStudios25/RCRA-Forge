@@ -16,6 +16,7 @@ from ui.asset_browser import AssetBrowser
 from ui.properties_panel import PropertiesPanel
 from ui.viewport import Viewport3D
 from ui.texture_viewer import TextureViewer
+from ui.controls_dialog import ControlsDialog
 from ui.scene_panel import ScenePanel
 from ui.hex_inspector import HexInspector
 from ui.skeleton_viewer import SkeletonViewer
@@ -460,6 +461,13 @@ class MainWindow(QMainWindow):
         act_frame.setShortcut(QKeySequence("F"))
         act_frame.triggered.connect(self._frame_scene)
         view_m.addAction(act_frame)
+
+        view_m.addSeparator()
+
+        act_controls = QAction("Viewport Controls…", self)
+        act_controls.setShortcut(QKeySequence("Ctrl+K"))
+        act_controls.triggered.connect(self._open_controls_dialog)
+        view_m.addAction(act_controls)
 
         # Help
         help_m = mb.addMenu("Help")
@@ -1089,9 +1097,15 @@ class MainWindow(QMainWindow):
     def _frame_scene(self):
         self._viewport.frame_model()
 
+    def _open_controls_dialog(self):
+        dlg = ControlsDialog(self)
+        dlg.exec()
+        # Always reload so viewport picks up any saved changes
+        self._viewport.reload_controls()
+
     def _show_about(self):
         QMessageBox.about(self, "About RCRA Forge",
-            "<h3>RCRA Forge v0.5.3</h3>"
+            "<h3>RCRA Forge v0.5.4</h3>"
             "<p>Ratchet &amp; Clank: Rift Apart level editor and model exporter.</p>"
             "<p>Format reverse engineering credit:<br>"
             "&nbsp;• chaoticgd / <i>ripped_apart</i> (MIT)<br>"

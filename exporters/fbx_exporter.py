@@ -506,9 +506,9 @@ class FbxExporter:
             f.write(buf.getvalue())
 
     def _world_transform(self, bone_idx: int):
-        joints  = self.model.joints
-        pos_arr = self.model.joint_positions
-        rot_arr = self.model.joint_quaternions
+        joints    = self.model.joints
+        pos_arr   = self.model.joint_positions
+        rot_arr   = self.model.joint_quaternions
         cache: dict = {}
 
         def compute(i):
