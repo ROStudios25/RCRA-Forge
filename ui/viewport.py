@@ -371,11 +371,24 @@ class Viewport3D(QOpenGLWidget):
         self._trigger_repaint()
 
     def _upload_textures(self, material_textures: dict):
-        """Upload RGBA8 pixel data as OpenGL textures and assign to GpuSubMeshes."""
+        """Upload RGBA8 pixel data as OpenGL textures and assign to GpuSubMeshes.
+        Accepts both old format {mat_idx: (rgba,w,h)} and new format
+        {mat_idx: {role: (rgba,w,h,tex_name)}} — uses albedo role for viewport."""
         import ctypes
         gl_tex_map = {}   # material_index → gl texture id
 
-        for mat_idx, (rgba_bytes, w, h) in material_textures.items():
+        for mat_idx, data in material_textures.items():
+            # New multi-slot format: {role: (rgba, w, h, tex_name)}
+            if isinstance(data, dict):
+                # Strict priority for viewport display: base_color → color_id → skip others
+                slot = data.get('base_color') or data.get('color_id')
+                if slot is None:
+                    continue   # don't fall back to normal/specular for viewport
+                rgba_bytes, w, h = slot[0], slot[1], slot[2]
+            else:
+                # Legacy format: (rgba, w, h)
+                rgba_bytes, w, h = data[0], data[1], data[2]
+
             if not rgba_bytes or w == 0 or h == 0:
                 continue
             try:
@@ -396,7 +409,6 @@ class Viewport3D(QOpenGLWidget):
                 print(f"[viewport] texture upload failed mat={mat_idx}: {ex}")
 
         # Assign textures directly by stored material_index — no iterator sync needed
-        # First clear any stale texture IDs from previous upload
         for gm in self._gpu_meshes:
             gm.texture_id = 0
         for gm in self._gpu_meshes:
@@ -523,7 +535,9 @@ class Viewport3D(QOpenGLWidget):
     def set_show_fur(self, enabled: bool):
         """Toggle visibility of fur/composite shell meshes."""
         self._show_fur = enabled
-        self._redraw()
+        self.update()
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents()
 
     # ── OpenGL Lifecycle ──────────────────────────────────────────────────────
 

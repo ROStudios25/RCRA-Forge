@@ -25,14 +25,18 @@ DAT1 layout (unk1 = 0x88730155 = 'material'):
                     uint32  asset_id_lo     — low 32 bits of texture asset CRC64 hash
     Then:         string table — null-separated texture paths
 
-  Texture slot naming convention (inferred from path suffixes):
-    _g  → albedo/gloss (base color)
-    _n  → normal map
-    _c  → color / albedo variant
-    _m  → metallic / mask
-    _v  → detail variant
-    _d  → detail
-    _s  → specular / subsurface
+  Texture slot naming convention (corrected by ilaac, May 2026):
+    _c   → base_color       (primary base color map)
+    id_  → color_id         (color ID — alternative base color when _c absent)
+    _g   → specular_color   (specular color — was mislabeled albedo)
+    _g_a → specular_ior     (Specular IOR Level, greyscale)
+    _m   → mask             (packed: R=emission_mask, G=height, B=AO)
+    _n   → normal           (normal map)
+    _ao  → ambient_occlusion (dedicated AO — replaces _m when present)
+    _sm  → micro_variation   (NPC dinosaur detail variation — Grunthors/Monks only, ~30 textures)
+    _v   → detail
+    _d   → detail_normal
+    _s   → specular
 
   The asset_id_lo (low 32 bits of CRC64) can be used to look up the full
   asset entry in the TOC via HashLookup, or the path string can be hashed
@@ -63,32 +67,55 @@ TAG_TEXTURE_TABLE    = 0xF5260180   # texture slot table + string table (from RE
 #   _d  → detail normal
 #   _ao → ambient occlusion (dedicated AO map, rare)
 _SUFFIX_ROLES = {
-    '_g':  'albedo',
-    '_c':  'color',
-    '_n':  'normal',
-    '_m':  'ao_emission',   # R=AO, G=Emission — NOT metallic
-    '_s':  'specular',
-    '_v':  'detail',
-    '_d':  'detail_normal',
-    '_ao': 'ambient_occlusion',
-    # Less common suffixes seen in some RCRA materials:
-    '_basecolor': 'albedo',
-    '_diffuse':   'albedo',
-    '_alb':       'albedo',
-    '_col':       'color',
+    # Base color
+    '_c':         'base_color',      # primary base color map
+    '_col':       'base_color',
+    '_basecolor': 'base_color',
+    '_diffuse':   'base_color',
+    '_alb':       'base_color',
+    # Specular color (_g was previously mislabeled as albedo — corrected by ilaac)
+    '_g':         'specular_color',  # specular color map
+    '_g_a':       'specular_ior',    # Specular IOR Level (greyscale)
+    # Packed mask (_m channels: R=emission mask, G=height, B=AO — confirmed ilaac)
+    '_m':         'mask',            # packed: R=emission_mask G=height B=ao
+    # Normal map
+    '_n':         'normal',
     '_nrm':       'normal',
     '_nor':       'normal',
-    '_h':         'unknown',   # height/displacement — not albedo
-    '_e':         'unknown',   # emissive mask variants
+    # Dedicated AO (replaces _m when present)
+    '_ao':        'ambient_occlusion',
+    # Detail maps
+    '_v':         'detail',
+    '_d':         'detail_normal',
+    '_s':         'specular',
+    # Micro-variation mask (NPC dinosaurs only — Grunthors, Monks)
+    # Used by npc_dinosaur_detail_variation materialgraph (~30 textures total)
+    # Makes each individual NPC look slightly unique
+    '_sm':        'micro_variation',
+    '_e':         'unknown',
+}
+
+# Prefix-based roles (checked separately — these are prefixes not suffixes)
+_PREFIX_ROLES = {
+    'id_':  'color_id',   # color ID map — alternative base color when _c is absent
 }
 
 
 def _infer_role(path: str) -> str:
-    """Infer texture slot role from the path suffix before .texture."""
+    """Infer texture slot role from path prefix or suffix before .texture."""
     stem = path.rsplit('.', 1)[0]   # strip .texture
+    filename = stem.rsplit('/', 1)[-1]  # just the filename
+
+    # Check prefixes first (e.g. id_something)
+    for prefix, role in _PREFIX_ROLES.items():
+        if filename.startswith(prefix):
+            return role
+
+    # Check suffixes
     for suffix, role in _SUFFIX_ROLES.items():
         if stem.endswith(suffix):
             return role
+
     return 'unknown'
 
 
@@ -117,19 +144,22 @@ class MaterialAsset:
 
     @property
     def albedo_slot(self) -> Optional['TextureSlot']:
-        # Priority 1: known albedo roles (_g, _c suffix)
+        """Primary base color slot — _c first, then color_id fallback."""
+        # Priority 1: base_color (_c)
         for s in self.slots:
-            if s.role in ('albedo', 'color'):
+            if s.role == 'base_color':
                 return s
-        # Priority 2: first slot that isn't a normal/AO/specular/detail map.
-        # RCRA materials almost always put the base color first. Some materials
-        # (e.g. rebellion boots) use non-standard path suffixes that don't match
-        # _g or _c, so we'd otherwise return None and show nothing.
-        _non_albedo = {'normal', 'ao_emission', 'specular', 'detail', 'detail_normal', 'ambient_occlusion'}
+        # Priority 2: color_id (id_ prefix) — used when _c is absent
+        for s in self.slots:
+            if s.role == 'color_id':
+                return s
+        # Priority 3: first non-utility slot
+        _non_albedo = {'normal', 'mask', 'specular_color', 'specular_ior',
+                       'specular', 'detail', 'detail_normal', 'ambient_occlusion', 'unknown'}
         for s in self.slots:
             if s.role not in _non_albedo:
                 return s
-        # Last resort: slot 0 regardless of role
+        # Last resort: slot 0
         return self.slots[0] if self.slots else None
 
     @property
@@ -140,15 +170,52 @@ class MaterialAsset:
         return None
 
     @property
-    def ao_emission_slot(self) -> Optional['TextureSlot']:
-        """R=AmbientOcclusion, G=Emission packed map (_m suffix)."""
+    def mask_slot(self) -> Optional['TextureSlot']:
+        """Packed mask map: R=emission_mask, G=height, B=AO (_m suffix)."""
         for s in self.slots:
-            if s.role == 'ao_emission':
+            if s.role == 'mask':
+                return s
+        return None
+
+    @property
+    def ao_emission_slot(self) -> Optional['TextureSlot']:
+        """Backwards-compat alias for mask_slot."""
+        return self.mask_slot
+
+    @property
+    def specular_color_slot(self) -> Optional['TextureSlot']:
+        """Specular color map (_g suffix)."""
+        for s in self.slots:
+            if s.role == 'specular_color':
+                return s
+        return None
+
+    @property
+    def specular_ior_slot(self) -> Optional['TextureSlot']:
+        """Specular IOR Level map (_g_a suffix)."""
+        for s in self.slots:
+            if s.role == 'specular_ior':
+                return s
+        return None
+
+    @property
+    def color_id_slot(self) -> Optional['TextureSlot']:
+        """Color ID map (id_ prefix) — alternative base color."""
+        for s in self.slots:
+            if s.role == 'color_id':
+                return s
+        return None
+
+    @property
+    def ao_slot(self) -> Optional['TextureSlot']:
+        """Dedicated AO map (_ao suffix) — replaces _m when present."""
+        for s in self.slots:
+            if s.role == 'ambient_occlusion':
                 return s
         return None
 
     def slot_by_role(self, role: str) -> Optional['TextureSlot']:
-        """Look up a slot by role string. Roles: albedo, color, normal, ao_emission, specular, detail, detail_normal."""
+        """Look up a slot by role string."""
         for s in self.slots:
             if s.role == role:
                 return s

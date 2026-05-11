@@ -117,7 +117,7 @@ class AssetLoader(QObject):
     """Load + parse a single asset on a background thread."""
     mesh_ready      = pyqtSignal(object)        # ModelAsset
     texture_ready   = pyqtSignal(object)        # TextureAsset
-    materials_ready = pyqtSignal(dict)          # {material_index: (rgba_bytes, w, h)}
+    materials_ready = pyqtSignal(dict)          # {mat_idx: {role: (rgba, w, h, tex_name)}}
     skel_ready      = pyqtSignal(object)        # Skeleton
     level_ready     = pyqtSignal(object, object)
     raw_ready       = pyqtSignal(bytes, str)    # raw bytes, label
@@ -190,7 +190,7 @@ class AssetLoader(QObject):
     def _load_model_textures(self, model):
         """
         For each unique material_index in LOD0 meshes, find the .material asset,
-        parse it, decode the albedo texture, and emit materials_ready.
+        parse it, decode all PBR texture slots, and emit materials_ready.
         """
         try:
             from core.material import parse_material_asset
@@ -213,14 +213,14 @@ class AssetLoader(QObject):
             TAG_MAT = 0x3250BB80
             mat_sec = dat1.sections.get(TAG_MAT)
 
-            result = {}
+            # PBR roles to decode (in priority order per slot)
+            PBR_SLOTS = ['albedo', 'color', 'normal', 'ao_emission', 'specular_ior']
+
+            result = {}  # {mat_idx: {role: (rgba, w, h, tex_name)}}
 
             for mat_idx in mat_indices:
                 try:
                     mat_name = None
-                    # RCRA TAG_MATERIALS format (confirmed from ALERT unknowns.py):
-                    # Each entry = 16 bytes = (matfile_str_off: u64, matname_str_off: u64)
-                    # matfile_str_off is an absolute offset into the DAT1 string pool
                     if mat_sec is not None:
                         sec = bytes(mat_sec)
                         ENTRY = 16
@@ -231,12 +231,10 @@ class AssetLoader(QObject):
                     if not mat_name:
                         continue
 
-                    # Normalize path: backslashes → forward slashes, lowercase
                     mat_name = mat_name.replace('\\', '/').lower()
                     if not mat_name.endswith('.material'):
                         mat_name += '.material'
 
-                    # Find .material asset by path
                     mat_asset_id = lookup.asset_id(mat_name)
                     if mat_asset_id is None:
                         mat_asset_id = lookup.asset_id(mat_name.lstrip('/'))
@@ -249,70 +247,77 @@ class AssetLoader(QObject):
 
                     mat_data = self.toc_parser.extract_asset(mat_entry)
                     mat_asset = parse_material_asset(mat_data)
-                    albedo = mat_asset.albedo_slot
-                    if albedo is None:
-                        # Log all available slots so we can debug
-                        slots = [(s.role, s.name) for s in mat_asset.slots]
-                        print(f"[texload] mat[{mat_idx}] no albedo slot. Available: {slots}")
-                        continue
 
-                    # Find + decode texture — normalize slashes and lowercase
-                    tex_path = albedo.path.replace('\\', '/').lower()
-                    tex_id = lookup.asset_id(tex_path)
-                    if tex_id is None:
-                        tex_id = lookup.asset_id(tex_path.lstrip('/'))
+                    mat_result = {}
 
-                    tex_entry = None
-                    if tex_id is not None:
-                        tex_entry = self.toc_parser.find_entry(tex_id)
+                    # Decode every slot whose role is in our export set
+                    # This ensures both _g (albedo) and _c (color mask) are captured,
+                    # along with normal, ao_emission, and specular_ior.
+                    from exporters.texture_exporter import EXPORT_ROLES
+                    for slot in mat_asset.slots:
+                        if slot.role not in EXPORT_ROLES:
+                            continue
+                        # Use role+index as key so both _g and _c can coexist
+                        role_key = slot.role if slot.role not in mat_result else f"{slot.role}_{slot.index}"
+                        try:
+                            tex_path = slot.path.replace('\\', '/').lower()
+                            tex_id = lookup.asset_id(tex_path)
+                            if tex_id is None:
+                                tex_id = lookup.asset_id(tex_path.lstrip('/'))
 
-                    # Fallback: use the asset_id_lo stored in the slot directly.
-                    # This works even when the path in hashes.txt doesn't match
-                    # what the material stores (e.g. rebellion boots, some bangles).
-                    if tex_entry is None and albedo.asset_id_lo:
-                        tex_entry = self.toc_parser.find_entry_by_id_lo(albedo.asset_id_lo)
-                        if tex_entry is not None:
-                            print(f"[texload] mat[{mat_idx}] path lookup failed for '{tex_path}', "
-                                  f"found via id_lo={albedo.asset_id_lo:#010x}")
+                            tex_entry = None
+                            if tex_id is not None:
+                                tex_entry = self.toc_parser.find_entry(tex_id)
 
-                    if tex_entry is None:
-                        print(f"[texload] mat[{mat_idx}] texture not found: {tex_path}")
-                        continue
-                    tex_data = self.toc_parser.extract_asset(tex_entry)
-                    tex = TextureParser(tex_data).parse()
+                            if tex_entry is None and slot.asset_id_lo:
+                                tex_entry = self.toc_parser.find_entry_by_id_lo(slot.asset_id_lo)
 
-                    # Try to load HD pixel data (separate larger TOC entry, same asset ID)
-                    if tex.hd_len > 0 and tex.hd_width > 0:
-                        all_entries = self.toc_parser.find_all_entries(tex_id)
-                        # HD entry is the largest one (SD is smaller)
-                        hd_candidates = [e for e in all_entries if e.size > tex_entry.size]
-                        if hd_candidates:
-                            hd_entry = max(hd_candidates, key=lambda e: e.size)
-                            try:
-                                hd_raw = self.toc_parser.extract_asset(hd_entry)
-                                # HD pixel data starts at offset 0x00 (no DAT1 header)
-                                tex.hd_pixel_data = bytes(hd_raw)
-                                print(f"[texload] mat[{mat_idx}] HD {tex.hd_width}×{tex.hd_height} loaded ({len(hd_raw):,} bytes)")
-                            except Exception as ex:
-                                print(f"[texload] mat[{mat_idx}] HD load failed: {ex}")
+                            if tex_entry is None:
+                                continue
 
-                    rgba = tex.decode_to_rgba()
-                    if rgba:
-                        result[mat_idx] = (rgba, tex.width, tex.height)
-                        print(f"[texload] mat[{mat_idx}] '{mat_name}' albedo {tex.width}×{tex.height}")
+                            tex_data = self.toc_parser.extract_asset(tex_entry)
+                            tex = TextureParser(tex_data).parse()
+
+                            # Try to load HD pixel data
+                            if tex.hd_len > 0 and tex.hd_width > 0 and tex_id is not None:
+                                all_entries = self.toc_parser.find_all_entries(tex_id)
+                                hd_candidates = [e for e in all_entries if e.size > tex_entry.size]
+                                if hd_candidates:
+                                    hd_entry = max(hd_candidates, key=lambda e: e.size)
+                                    try:
+                                        hd_raw = self.toc_parser.extract_asset(hd_entry)
+                                        tex.hd_pixel_data = bytes(hd_raw)
+                                        if slot.role == 'albedo':
+                                            print(f"[texload] mat[{mat_idx}] HD {tex.hd_width}×{tex.hd_height} loaded ({len(hd_raw):,} bytes)")
+                                    except Exception:
+                                        pass
+
+                            rgba = tex.decode_to_rgba()
+                            if rgba:
+                                tex_name = slot.name
+                                w = tex.hd_width if tex.hd_pixel_data else tex.width
+                                h = tex.hd_height if tex.hd_pixel_data else tex.height
+                                mat_result[role_key] = (rgba, w, h, tex_name)
+                                if slot.role == 'albedo':
+                                    print(f"[texload] mat[{mat_idx}] '{mat_name}' albedo {w}×{h}")
+                                else:
+                                    print(f"[texload] mat[{mat_idx}] {slot.role} {w}×{h} ({tex_name})")
+
+                        except Exception as ex:
+                            print(f"[texload] mat[{mat_idx}] {slot.role} failed: {ex}")
+
+                    if mat_result:
+                        result[mat_idx] = mat_result
 
                 except Exception as ex:
                     print(f"[texload] mat[{mat_idx}] failed: {ex}")
 
-            if result:
-                self.materials_ready.emit(result)
-            else:
-                # Always emit so the thread quits cleanly
-                self.materials_ready.emit({})
+            self.materials_ready.emit(result if result else {})
 
         except Exception as ex:
             import traceback
             print(f"[texload] error: {ex}\n{traceback.format_exc()}")
+            self.materials_ready.emit({})
             self.materials_ready.emit({})
 
 
@@ -938,6 +943,7 @@ class MainWindow(QMainWindow):
             asset_name = lookup.name(entry.asset_id)
 
         self._props.set_entry(entry, name=asset_name)
+        self._current_entry = entry   # cached for texture export mat_names lookup
         self._status_lbl.setText(f"Loading asset {entry.asset_id:#018x}…")
 
         self._asset_thread = QThread(self)
@@ -948,6 +954,7 @@ class MainWindow(QMainWindow):
         self._asset_loader.mesh_ready.connect(self._on_mesh_ready)
         self._asset_loader.texture_ready.connect(self._on_texture_ready)
         self._asset_loader.materials_ready.connect(self._viewport.load_textures)
+        self._asset_loader.materials_ready.connect(self._on_materials_ready)
         self._asset_loader.skel_ready.connect(self._on_skel_ready)
         self._asset_loader.level_ready.connect(self._on_level_ready)
         self._asset_loader.raw_ready.connect(self._on_raw_ready)
@@ -1060,6 +1067,26 @@ class MainWindow(QMainWindow):
             f"Texture loaded — {tex_asset.width}×{tex_asset.height} {tex_asset.format_name}"
         )
 
+    def _on_materials_ready(self, tex_data: dict):
+        """Cache decoded texture data in the properties panel for texture export."""
+        if not tex_data:
+            return
+        # Build mat_names from the current model asset (already parsed, no re-extraction needed)
+        mat_names = {}
+        try:
+            model = getattr(self._viewport, '_current_model', None)
+            if model and model.material_names:
+                for mat_idx in tex_data:
+                    if mat_idx < len(model.material_names):
+                        raw = model.material_names[mat_idx]
+                        # Use just the filename stem
+                        mat_names[mat_idx] = raw.replace('\\', '/').split('/')[-1].replace('.material', '')
+        except Exception:
+            pass
+
+        self._props._cached_tex_data = tex_data
+        self._props._mat_names       = mat_names
+
     def _on_skel_ready(self, skel):
         self._skel_viewer.load_skeleton(skel)
         self._tab_panel.setCurrentWidget(self._skel_viewer)
@@ -1105,7 +1132,7 @@ class MainWindow(QMainWindow):
 
     def _show_about(self):
         QMessageBox.about(self, "About RCRA Forge",
-            "<h3>RCRA Forge v0.5.4</h3>"
+            "<h3>RCRA Forge v0.5.5</h3>"
             "<p>Ratchet &amp; Clank: Rift Apart level editor and model exporter.</p>"
             "<p>Format reverse engineering credit:<br>"
             "&nbsp;• chaoticgd / <i>ripped_apart</i> (MIT)<br>"

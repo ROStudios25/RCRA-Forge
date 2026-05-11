@@ -211,6 +211,32 @@ class PropertiesPanel(QWidget):
         fmt_row.addWidget(self._fmt_combo)
         elayout.addLayout(fmt_row)
 
+        # Texture export controls
+        tex_row = QHBoxLayout()
+        self._export_tex_chk = QCheckBox("Export textures")
+        self._export_tex_chk.setChecked(True)
+        self._export_tex_chk.setToolTip(
+            "Export PBR textures alongside the model\n"
+            "(albedo, normal, AO/emission, specular IOR)"
+        )
+        self._export_tex_chk.toggled.connect(self._on_tex_export_toggled)
+        tex_row.addWidget(self._export_tex_chk)
+
+        self._tex_fmt_combo = QComboBox()
+        self._tex_fmt_combo.addItems(["PNG", "DDS", "PNG + DDS"])
+        self._tex_fmt_combo.setToolTip("PNG = universal; DDS = BCn compressed (smaller)")
+        tex_row.addWidget(self._tex_fmt_combo)
+
+        self._embed_tex_chk = QCheckBox("Embed in GLB")
+        self._embed_tex_chk.setChecked(False)
+        self._embed_tex_chk.setToolTip(
+            "Embed textures inside the GLB file (self-contained)\n"
+            "If unchecked, textures are written to a textures/ subfolder"
+        )
+        tex_row.addWidget(self._embed_tex_chk)
+        tex_row.addStretch()
+        elayout.addLayout(tex_row)
+
         # LOD selector
         lod_row = QHBoxLayout()
         lod_row.addWidget(QLabel("LOD:"))
@@ -438,6 +464,12 @@ class PropertiesPanel(QWidget):
 
     # ── Private ───────────────────────────────────────────────────────────────
 
+    def _on_tex_export_toggled(self, checked: bool):
+        """Show/hide texture format and embed controls based on checkbox state."""
+        self._tex_fmt_combo.setEnabled(checked)
+        self._embed_tex_chk.setEnabled(checked and
+            self._fmt_combo.currentIndex() in (0, 1))  # only GLB/GLTF can embed
+
     def _on_lod_changed(self, index: int):
         self.lod_changed.emit(index)
 
@@ -580,8 +612,10 @@ class PropertiesPanel(QWidget):
 
         try:
             from exporters.gltf_exporter import GltfExporter, ObjExporter
-            lod  = self._lod_combo.currentIndex()
-            stem = os.path.splitext(os.path.basename(path))[0]
+            lod    = self._lod_combo.currentIndex()
+            stem   = os.path.splitext(os.path.basename(path))[0]
+            outdir = os.path.dirname(path)
+
             if fmt == 'glb':
                 GltfExporter(self._mesh_asset, stem, lod=lod).export_glb(path)
             elif fmt == 'gltf':
@@ -594,6 +628,27 @@ class PropertiesPanel(QWidget):
             elif fmt == 'ascii':
                 from exporters.ascii_exporter import export_ascii
                 export_ascii(self._mesh_asset, path, lod=lod)
+
+            # ── Texture export ────────────────────────────────────────────────
+            tex_data = getattr(self, '_cached_tex_data', None)
+            if (self._export_tex_chk.isChecked()
+                    and tex_data
+                    and fmt in ('glb', 'gltf', 'fbx', 'obj')):
+                try:
+                    from exporters.texture_exporter import TextureExporter
+                    tex_fmt_map = {0: 'png', 1: 'dds', 2: 'both'}
+                    tex_fmt = tex_fmt_map[self._tex_fmt_combo.currentIndex()]
+
+                    mat_names = getattr(self, '_mat_names', {})
+                    exporter = TextureExporter(tex_data, mat_names, outdir, stem)
+                    exported = exporter.export(fmt=tex_fmt)
+
+                    n_tex = sum(len(r) for r in exported.values())
+                    print(f"[texexport] exported {n_tex} texture(s) to {outdir}/textures/")
+                except Exception as tex_ex:
+                    import traceback
+                    print(f"[texexport] texture export failed: {tex_ex}\n{traceback.format_exc()}")
+
             self._on_export_done(path)
         except Exception as ex:
             import traceback
