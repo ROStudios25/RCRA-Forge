@@ -119,6 +119,7 @@ class AssetLoader(QObject):
     texture_ready   = pyqtSignal(object)        # TextureAsset
     materials_ready = pyqtSignal(dict)          # {mat_idx: {role: (rgba, w, h, tex_name)}}
     skel_ready      = pyqtSignal(object)        # Skeleton
+    zone_ready      = pyqtSignal(object)        # ZoneDef
     level_ready     = pyqtSignal(object, object)
     raw_ready       = pyqtSignal(bytes, str)    # raw bytes, label
     error           = pyqtSignal(str)
@@ -173,7 +174,19 @@ class AssetLoader(QObject):
                 tex = TextureParser(data).parse()
                 self.texture_ready.emit(tex)
 
-            elif atype in ('level', 'zone'):
+            elif atype == 'zone':
+                from core.zone import parse_zone_asset
+                zone_name = label or f'zone_{self.entry.asset_id:#018x}'
+                zone = parse_zone_asset(data, self.entry.asset_id, zone_name,
+                                        lookup=self.lookup)
+                if zone is not None:
+                    kind = "art" if zone.is_art_zone else "gp"
+                    print(f"[AssetLoader] zone parsed: {zone.entry_count} scene nodes ({kind} zone)")
+                    self.zone_ready.emit(zone)
+                else:
+                    print(f"[AssetLoader] zone parse returned None for unk1={dat1.unk1:#010x}")
+
+            elif atype == 'level':
                 from core.level import LevelParser
                 lp = LevelParser(data)
                 info = lp.parse_info()
@@ -378,6 +391,7 @@ class MainWindow(QMainWindow):
         top_splitter.addWidget(self._viewport)
 
         self._props = PropertiesPanel()
+        self._props.set_export_zone_fn(self._on_export_zone_requested)
         self._props.setMinimumWidth(200)
         top_splitter.addWidget(self._props)
         top_splitter.setSizes([900, 280])
@@ -956,6 +970,7 @@ class MainWindow(QMainWindow):
         self._asset_loader.materials_ready.connect(self._viewport.load_textures)
         self._asset_loader.materials_ready.connect(self._on_materials_ready)
         self._asset_loader.skel_ready.connect(self._on_skel_ready)
+        self._asset_loader.zone_ready.connect(self._on_zone_ready)
         self._asset_loader.level_ready.connect(self._on_level_ready)
         self._asset_loader.raw_ready.connect(self._on_raw_ready)
         self._asset_loader.error.connect(self._on_asset_error)
@@ -1099,6 +1114,75 @@ class MainWindow(QMainWindow):
         )
         self._props.log(f"[INFO] {level_info.description}")
 
+    def _on_zone_ready(self, zone):
+        self._scene_panel.load_zone(zone)
+        self._props.set_zone(zone)
+        self._tab_panel.setCurrentWidget(self._scene_panel)
+        kind = "art" if zone.is_art_zone else "gp"
+        n_with_model = sum(1 for e in zone.entries if e.model_id)
+        self._status_lbl.setText(
+            f"Zone loaded — {zone.entry_count} scene node(s) ({kind})"
+        )
+        print(f"[zone] {zone.name}: {zone.entry_count} entries, "
+              f"is_art={zone.is_art_zone}, "
+              f"model_ids={len(zone.model_ids or [])}, "
+              f"entries_with_model_id={n_with_model}")
+
+    def _on_export_zone_requested(self, zone):
+        """Export all resolved zone actors as a single GLB with world transforms."""
+        from PyQt6.QtWidgets import QFileDialog, QProgressDialog
+        from PyQt6.QtCore import Qt
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Zone as GLB",
+            zone.name.split('/')[-1].replace('.zone', '') + "_assembled.glb",
+            "GLB Files (*.glb)"
+        )
+        if not path:
+            return
+
+        # Progress dialog
+        progress = QProgressDialog("Assembling zone...", "Cancel", 0, zone.entry_count, self)
+        progress.setWindowTitle("Zone Export")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+
+        try:
+            from core.level_assembler import LevelAssembler, export_zone_glb
+
+            def on_progress(current, total):
+                progress.setValue(current)
+                progress.setLabelText(f"Resolving node {current}/{total}…")
+                from PyQt6.QtWidgets import QApplication
+                QApplication.processEvents()
+
+            assembler = LevelAssembler(self._toc_parser, self._browser._lookup)
+            result    = assembler.assemble_zone(zone, progress_cb=on_progress)
+
+            progress.setLabelText(f"Writing GLB…")
+            QApplication.processEvents()
+
+            n = export_zone_glb(result, path)
+            progress.close()
+
+            skipped = result.skip_count
+            self._status_lbl.setText(
+                f"Zone exported — {n} model(s) placed, {skipped} skipped"
+            )
+            print(f"[zone export] {n} nodes → {path}")
+            if skipped:
+                print(f"[zone export] {skipped} skipped:")
+                for entry, reason in result.skipped:
+                    id_str = f"{entry.asset_id:#018x}"
+                    label  = entry.name or id_str
+                    print(f"  [{entry.index}] {label} ({id_str}): {reason}")
+
+        except Exception as ex:
+            import traceback
+            progress.close()
+            self._status_lbl.setText(f"Zone export failed: {ex}")
+            print(f"[zone export] error: {ex}\n{traceback.format_exc()}")
+
     def _on_raw_ready(self, data: bytes, label: str):
         self._hex_inspector.load_data(data, label)
 
@@ -1106,8 +1190,20 @@ class MainWindow(QMainWindow):
         self._status_lbl.setText(f"Asset error: {msg}")
         self._props.log(f"[ERR] {msg}")
 
-    def _on_instance_selected(self, inst):
-        # Focus viewport camera on the instance's world position
+    def _on_instance_selected(self, entry):
+        """Focus viewport camera on the selected scene node's world position."""
+        try:
+            import numpy as np
+            pos = np.array([entry.x, entry.y, entry.z], dtype='float32')
+            self._viewport.camera.target = pos
+            self._viewport.camera.distance = 20.0
+            self._viewport.update()
+            self._status_lbl.setText(
+                f"Scene node: {entry.name.split(chr(92))[-1] if entry.name else 'unnamed'} "
+                f"— pos ({entry.x:.1f}, {entry.y:.1f}, {entry.z:.1f})"
+            )
+        except Exception:
+            pass
         pos = inst.position
         self._viewport.camera.target = pos.astype('float32')
         self._viewport.update()

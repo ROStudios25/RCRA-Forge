@@ -388,7 +388,7 @@ class ModelParser:
         joints_data = dat1.get_section(TAG_JOINTS)
         xform_data  = dat1.get_section(TAG_JOINT_XFORMS)
         if not joints_data:
-            return [], [], []
+            return [], [], [], []
 
         ENTRY_SIZE = 16
         joints = []

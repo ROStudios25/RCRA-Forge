@@ -278,6 +278,16 @@ class PropertiesPanel(QWidget):
         self._btn_export_group.clicked.connect(self._do_export_group)
         elayout.addWidget(self._btn_export_group)
 
+        self._btn_export_zone = QPushButton("🗺  Export Zone as GLB")
+        self._btn_export_zone.setObjectName("ExportBtn")
+        self._btn_export_zone.setEnabled(False)
+        self._btn_export_zone.setToolTip(
+            "Resolve all zone scene nodes to models and export as a single GLB\n"
+            "with correct world-space transforms. Load a .zone asset first."
+        )
+        self._btn_export_zone.clicked.connect(self._do_export_zone)
+        elayout.addWidget(self._btn_export_zone)
+
         # Progress
         self._progress = QProgressBar()
         self._progress.setRange(0, 0)   # indeterminate
@@ -475,6 +485,23 @@ class PropertiesPanel(QWidget):
 
     def _do_clear_export_list(self):
         self.clear_export_list()
+
+    def set_zone(self, zone):
+        """Called when a zone asset is loaded — enables zone export button."""
+        self._current_zone = zone
+        self._btn_export_zone.setEnabled(zone is not None)
+
+    def _do_export_zone(self):
+        """Triggered by Export Zone as GLB button."""
+        zone = getattr(self, '_current_zone', None)
+        if zone is None:
+            return
+        # Delegate to main window handler via signal
+        self._export_zone_fn(zone)
+
+    def set_export_zone_fn(self, fn):
+        """Inject the export function from main_window to avoid circular imports."""
+        self._export_zone_fn = fn
 
     def _do_export_list(self):
         entries = self.get_export_list_entries()

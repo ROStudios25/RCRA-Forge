@@ -65,12 +65,14 @@ ASSET_TYPE_NAMES = {
     0xDB40514C: 'model',       # MM/Miles Morales
     0x9D2C0FA9: 'model',       # RCRA/Rift Apart ← ModelRcra
     0x5C4580B9: 'texture',
-    0x8A0B1487: 'zone',
+    0x8A0B1487: 'zone',        # Zone container type
+    0x1F390AA0: 'zone',        # ZoneDef (tile/gp zones) ← confirmed from binary
     0x2AFE7495: 'level',
     0x21A56F68: 'config',
     0xF777E4A8: 'animset',
     0xC96F58F3: 'animclip',
     0x7C207220: 'actor',
+    0x944BD3AD: 'actor',        # confirmed from binary (actor built file)
     0x39F27E27: 'atmosphere',
     0x1C04EF8C: 'material',
     0x07DC03E3: 'materialgraph',

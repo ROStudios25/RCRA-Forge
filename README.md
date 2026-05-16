@@ -95,6 +95,21 @@ https://github.com/ROStudios25/RCRA-Forge
 
 ## Changelog
 
+### v0.5.6 — Zone Export (W.I.P)
+- **New: Zone asset parsing** — `.zone` files are now detected, extracted and parsed. Supports both GP (gameplay actor) zones and art (architecture/props) zones
+- **New: Scene panel zone view** — loading a zone shows all scene nodes in a tree with resolved model names and world positions
+- **New: Export Zone as GLB** button in the Properties panel — exports all zone model instances into a single GLB with correct world placement and Y-axis rotation
+- **New: `core/zone.py`** — dual-format zone parser. Art zone entries: 320-byte entries, 32-byte section header; position at `+0x10`, model index at `+0xF0`, rotation row at `+0x00`. GP zone entries: 176-byte entries; position at `+0x30`, instance ID at `+0x80`
+- **New: `core/actor.py`** — actor DAT1 parser for resolving GP zone actor paths to model asset IDs
+- **New: `core/level_assembler.py`** — assembles zone entries into a placed scene, resolving model IDs against the TOC and building world transform matrices
+- **New: Mesh instancing in zone GLB export** — each unique model's geometry is written to the buffer once and referenced by all instances. Walkways zone: 45 unique models across 15,835 nodes exports at ~5-15 MB instead of 1.44 GB
+- **Fix: `core/mesh.py`** — `_parse_joints()` early return now correctly returns a 4-tuple instead of 3-tuple, fixing asset errors on static prop models with no skeleton section
+- **Known limitation:** Art zone rotation — only Y-axis rotation is decoded from the single rotation row stored at entry `+0x00`. Non-Y-axis rotations are not yet parsed
+- **Known limitation:** Mystery model `0xA3752E833A35E226` (480 walkway connector instances) is not present in the main TOC — likely stored in a streaming or patch archive
+- **Known limitation:** Zone GLBs do not include textures — export individual models for textured output
+
+> **Blender import note:** Set **Clip End to 100000** in the N panel → View tab before importing zone GLBs. Zones span several km and Blender's default 1000m clip distance hides all geometry. After import, Select All (`A`) then Numpad Period to frame the scene.
+
 ### v0.5.5
 - **New: Bundled texture export** — "Export textures" checkbox in the Properties panel writes all decoded PBR texture slots to a `textures/` subfolder alongside the exported model. Format options: PNG (universal), DDS (BCn compressed, smaller), or both. Shared textures (e.g. tiling detail maps used by multiple materials) are deduplicated — written once only
 - **New: `exporters/texture_exporter.py`** — PNG writer (Pillow with pure-Python fallback), DDS writer (BC7 via imagecodecs, uncompressed fallback), GLB material embedding, FBX texture path helper
