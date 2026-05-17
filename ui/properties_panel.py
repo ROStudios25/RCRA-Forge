@@ -674,7 +674,7 @@ class PropertiesPanel(QWidget):
         entries = self.get_export_list_entries()
         if not entries:
             return
-        if not self._archive_path:
+        if self._toc_parser is None:
             self._list_status.setText("✗ No archive loaded — open a game folder first")
             return
 
@@ -692,18 +692,13 @@ class PropertiesPanel(QWidget):
         QApplication.processEvents()
 
         try:
-            from core.archive import TocParser
             from core.mesh import ModelParser
             from exporters.group_exporter import GroupExporter
-
-            # Use parse() to properly read the TOC file before extracting assets
-            toc = TocParser(self._archive_path)
-            toc.parse()
 
             exporter = GroupExporter()
             for entry in entries:
                 try:
-                    raw = toc.extract_asset(entry)
+                    raw = self._toc_parser.extract_asset(entry)
                     model = ModelParser(raw).parse()
                     name = f"asset_{entry.asset_id:016X}"
                     # Try to get a display name from the list widget
@@ -735,7 +730,7 @@ class PropertiesPanel(QWidget):
     def _do_export_group(self):
         if not self._group:
             return
-        if not self._archive_path:
+        if self._toc_parser is None:
             self._export_status.setText("✗ No archive loaded — open a game folder first")
             return
 

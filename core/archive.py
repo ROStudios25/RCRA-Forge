@@ -285,13 +285,36 @@ class TocParser:
         self._dat1:    Optional[DAT1]    = None
 
     def parse(self) -> list[AssetEntry]:
+        return self.parse_with_progress()
+
+    def parse_with_progress(self, progress=None) -> list[AssetEntry]:
+        """
+        Parse the TOC file and build the asset index.
+
+        Parameters
+        ----------
+        progress : callable(str) | None
+            Optional callback invoked with a human-readable status string
+            at each major step. Safe to call from any thread.
+
+        Returns
+        -------
+        list[AssetEntry]  (actually a _LazyEntryList)
+        """
+        def _emit(msg: str):
+            if progress:
+                progress(msg)
+
+        _emit("Reading toc file from disk…")
         with open(self.toc_path, 'rb') as f:
             raw = f.read()
 
+        _emit(f"Parsing DAT1 container ({len(raw) // 1024:,} KB)…")
         magic, size = struct.unpack_from('<II', raw, 0)
 
         if magic == TOC_MAGIC_RCRA:
-            dat1_data = raw[8:8 + size]
+            # memoryview — zero-copy slice of the raw buffer
+            dat1_data = memoryview(raw)[8:8 + size]
         elif magic == TOC_MAGIC_MSMR:
             dat1_data = zlib.decompress(raw[8:])
         else:
@@ -301,9 +324,35 @@ class TocParser:
                 f"or {TOC_MAGIC_MSMR:#010x} (Spider-Man/MSMR)."
             )
 
-        self._dat1 = DAT1(dat1_data)
+        self._dat1 = DAT1(bytes(dat1_data))
+        del raw  # free the raw buffer immediately after slicing
+
+        _emit("Building asset index…")
         self._build_entries()
         return self.entries
+
+    def group_by_archive(self) -> list[tuple[int, object]]:
+        """
+        Group entry indices by archive number.
+
+        Returns a list of (archive_index, numpy_index_array) tuples,
+        one per archive, sorted by archive index.  The index arrays
+        can be used to slice self.entries directly.
+
+        Must be called after parse() / parse_with_progress().
+        """
+        import numpy as np
+        entries  = self.entries
+        arc_col  = entries._sizes['archive'][:len(entries)].astype(np.int32)
+        sort_idx = np.argsort(arc_col, kind='stable')
+        sorted_arcs = arc_col[sort_idx]
+        boundaries  = np.where(np.diff(sorted_arcs))[0] + 1
+        starts = np.concatenate([[0], boundaries])
+        ends   = np.concatenate([boundaries, [len(sort_idx)]])
+        return [
+            (int(sorted_arcs[s]), sort_idx[s:e])
+            for s, e in zip(starts.tolist(), ends.tolist())
+        ]
 
     def _build_entries(self):
         import numpy as np

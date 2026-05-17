@@ -38,85 +38,74 @@ class TocLoader(QObject):
         self.path = path
 
     def run(self):
-        import time, struct, zlib
+        """
+        Qt threading adapter — delegates all TOC parsing to core/archive.py.
+        No parse logic lives here; this method only wires signals and timing.
+        """
+        import time
+        import threading
         print(f"[TocLoader] run() started, path={self.path}")
         try:
             t0 = time.time()
 
-            self.progress.emit("Reading toc file from disk…")
-            with open(self.path, 'rb') as f:
-                raw = f.read()
-            t1 = time.time()
+            from core.archive import TocParser
+            from core.hashes import get_lookup, try_load_from_game_root
 
-            self.progress.emit(f"Parsing DAT1 container ({len(raw)//1024:,} KB)…")
-            from core.archive import TOC_MAGIC_RCRA, TOC_MAGIC_MSMR, DAT1, TocParser
-            magic, size = struct.unpack_from('<II', raw, 0)
-            if magic == TOC_MAGIC_RCRA:
-                # Use memoryview — zero copy slice of the 12MB buffer
-                dat1_data = memoryview(raw)[8:8 + size]
-            elif magic == TOC_MAGIC_MSMR:
-                dat1_data = zlib.decompress(raw[8:])
-            else:
-                raise ValueError(f"Unknown TOC magic {magic:#010x}")
-            dat1 = DAT1(bytes(dat1_data))  # DAT1 needs bytes for struct.unpack_from
-            del raw  # free the 12MB buffer immediately after slicing
-            t2 = time.time()
-
-            self.progress.emit("Building asset index…")
             parser = TocParser(self.path)
-            parser._dat1 = dat1
-            parser._build_entries()
-            t3 = time.time()
 
-            self.progress.emit("Grouping assets by archive…")
-            import numpy as np
+            # parse_with_progress owns all read/decompress/index steps
+            steps: list[tuple[float, str]] = []
+            def _on_progress(msg: str):
+                steps.append((time.time(), msg))
+                self.progress.emit(msg)
+
+            parser.parse_with_progress(_on_progress)
+            entries = parser.entries
+
+            self.progress.emit("Grouping assets by archive\u2026")
             print("[TocLoader] grouping...")
-            entries     = parser.entries
-            arc_col     = entries._sizes['archive'][:len(entries)].astype(np.int32)
-            sort_idx    = np.argsort(arc_col, kind='stable')
-            sorted_arcs = arc_col[sort_idx]
-            boundaries  = np.where(np.diff(sorted_arcs))[0] + 1
-            starts = np.concatenate([[0], boundaries])
-            ends   = np.concatenate([boundaries, [len(sort_idx)]])
-            groups = [
-                (int(sorted_arcs[s]), sort_idx[s:e])
-                for s, e in zip(starts.tolist(), ends.tolist())
-            ]
+            groups = parser.group_by_archive()
             print(f"[TocLoader] grouped into {len(groups)} archives")
 
-            # Load hashes.txt asynchronously
-            self.progress.emit("TOC ready — loading asset names in background…")
-            from core.hashes import get_lookup, try_load_from_game_root
-            lookup = get_lookup()
+            # Load hashes.txt on a daemon thread; emit hashes_ready when done
+            self.progress.emit("TOC ready \u2014 loading asset names in background\u2026")
             game_root = os.path.dirname(self.path)
+            lookup    = get_lookup()
             print(f"[TocLoader] starting hashes thread, game_root={game_root}")
 
-            import threading
             def _load_hashes():
                 print("[hashes thread] starting...")
                 try_load_from_game_root(game_root)
                 print(f"[hashes thread] done, {len(lookup)} entries")
                 self.hashes_ready.emit(lookup)
 
-            t = threading.Thread(target=_load_hashes, daemon=True)
-            t.start()
+            threading.Thread(target=_load_hashes, daemon=True).start()
 
-            timing = (
-                f"disk:{t1-t0:.2f}s  "
-                f"dat1:{t2-t1:.2f}s  "
-                f"index:{t3-t2:.2f}s  "
-                f"total:{time.time()-t0:.2f}s"
-            )
+            # Build timing string from progress step timestamps
+            t_total = time.time() - t0
+            if len(steps) >= 3:
+                t_disk  = steps[1][0] - steps[0][0]
+                t_dat1  = steps[2][0] - steps[1][0]
+                t_index = time.time() - steps[2][0]
+                timing  = (f"disk:{t_disk:.2f}s  dat1:{t_dat1:.2f}s  "
+                           f"index:{t_index:.2f}s  total:{t_total:.2f}s")
+            else:
+                timing = f"total:{t_total:.2f}s"
+
             print(f"[TocLoader] emitting finished signal, {len(entries):,} entries")
-            self.progress.emit(f"Done — {len(entries):,} assets  (names loading…)")
+            self.progress.emit(f"Done \u2014 {len(entries):,} assets  (names loading\u2026)")
             self.finished.emit(parser, entries, timing, groups)
         except Exception as ex:
             import traceback
             self.error.emit(f"{ex}\n{traceback.format_exc()}")
-
-
 class AssetLoader(QObject):
-    """Load + parse a single asset on a background thread."""
+    """
+    Qt threading adapter — runs core.asset_loader on a background thread
+    and fans out results as typed signals.
+
+    All dispatch and parse logic lives in core/asset_loader.py.
+    This class is a thin signal bridge: no parsing happens here.
+    """
     mesh_ready      = pyqtSignal(object)        # ModelAsset
     texture_ready   = pyqtSignal(object)        # TextureAsset
     materials_ready = pyqtSignal(dict)          # {mat_idx: {role: (rgba, w, h, tex_name)}}
@@ -133,207 +122,45 @@ class AssetLoader(QObject):
         self.lookup     = lookup
 
     def run(self):
-        import time
-        t0 = time.perf_counter()
         try:
-            print(f"[AssetLoader] extracting {self.entry.asset_id:#018x} "
-                  f"size={self.entry.size:,} archive={self.entry.archive}")
-            data = self.toc_parser.extract_asset(self.entry)
-            print(f"[AssetLoader] extracted {len(data):,} bytes in {time.perf_counter()-t0:.3f}s")
+            from core.asset_loader import load_asset, load_model_textures
+            from core.hashes import get_lookup
 
-            # Use asset name as label if lookup is available, else hex ID
-            if self.lookup and self.lookup.is_loaded():
-                label = self.lookup.name(self.entry.asset_id)
-            else:
-                label = f'asset_{self.entry.asset_id:#018x}'
-            self.raw_ready.emit(data, label)
+            result = load_asset(self.entry, self.toc_parser, self.lookup)
 
-            from core.archive import DAT1, ASSET_TYPE_NAMES
-            dat1 = DAT1(data)
-            atype = ASSET_TYPE_NAMES.get(dat1.unk1, '')
-            print(f"[AssetLoader] DAT1 type={atype} unk1={dat1.unk1:#010x} "
-                  f"sections={len(dat1.sections)}")
+            # Raw bytes always emitted first (feeds hex inspector)
+            self.raw_ready.emit(result.raw, result.label)
 
-            if atype == 'model':
-                print("[AssetLoader] parsing model...")
-                from core.mesh import ModelParser
-                from core.skeleton import Skeleton
-                model = ModelParser(data).parse()
-                print(f"[AssetLoader] model parsed: {len(model.vertexes)} verts, "
-                      f"{len(model.meshes)} meshes, {len(model.indexes)} indices")
-                self.mesh_ready.emit(model)
-                skel = Skeleton.from_model(model)
-                if skel and skel.bones:
-                    print(f"[AssetLoader] skeleton: {len(skel.bones)} bones")
-                    self.skel_ready.emit(skel)
+            if result.error and not any([result.model, result.texture,
+                                         result.zone, result.level]):
+                self.error.emit(result.error)
+                return
 
-                # Load materials and decode albedo textures
-                # Always emit materials_ready (even empty) so the thread quits cleanly
-                self._load_model_textures(model)
+            if result.model is not None:
+                self.mesh_ready.emit(result.model)
+                if result.skeleton is not None:
+                    self.skel_ready.emit(result.skeleton)
+                # Texture loading is last — materials_ready triggers thread quit
+                lookup = self.lookup or get_lookup()
+                tex_data = load_model_textures(
+                    result.model, self.entry, self.toc_parser, lookup
+                )
+                self.materials_ready.emit(tex_data)
 
-            elif atype == 'texture':
-                from core.texture import TextureParser
-                tex = TextureParser(data).parse()
-                self.texture_ready.emit(tex)
+            elif result.texture is not None:
+                self.texture_ready.emit(result.texture)
 
-            elif atype == 'zone':
-                from core.zone import parse_zone_asset
-                zone_name = label or f'zone_{self.entry.asset_id:#018x}'
-                zone = parse_zone_asset(data, self.entry.asset_id, zone_name,
-                                        lookup=self.lookup)
-                if zone is not None:
-                    kind = "art" if zone.is_art_zone else "gp"
-                    print(f"[AssetLoader] zone parsed: {zone.entry_count} scene nodes ({kind} zone)")
-                    self.zone_ready.emit(zone)
-                else:
-                    print(f"[AssetLoader] zone parse returned None for unk1={dat1.unk1:#010x}")
+            elif result.zone is not None:
+                self.zone_ready.emit(result.zone)
 
-            elif atype == 'level':
-                from core.level import LevelParser
-                lp = LevelParser(data)
-                info = lp.parse_info()
-                self.level_ready.emit(info, None)
+            elif result.level is not None:
+                self.level_ready.emit(result.level, None)
 
-            else:
-                # Unknown/unhandled — raw bytes already emitted above
-                pass
+            # Unknown/unhandled types: raw already emitted, nothing more to do.
 
         except Exception as ex:
             import traceback
             self.error.emit(f"{ex}\n{traceback.format_exc()}")
-
-    def _load_model_textures(self, model):
-        """
-        For each unique material_index in LOD0 meshes, find the .material asset,
-        parse it, decode all PBR texture slots, and emit materials_ready.
-        """
-        try:
-            from core.material import parse_material_asset
-            from core.texture import TextureParser
-            from core.hashes import get_lookup
-            import struct
-
-            lookup = self.lookup or get_lookup()
-            if not lookup or not lookup.is_loaded():
-                return
-
-            # Collect unique material indices from look 0 / LOD 0 only
-            mat_indices = sorted({m.material_index for m in model.meshes
-                                  if m.look_index == 0 and m.lod_level == 0})
-
-            # Read material names from TAG_MATERIALS section (0x3250BB80)
-            from core.archive import DAT1
-            raw = self.toc_parser.extract_asset(self.entry)
-            dat1 = DAT1(raw)
-            TAG_MAT = 0x3250BB80
-            mat_sec = dat1.sections.get(TAG_MAT)
-
-            # PBR roles to decode (in priority order per slot)
-            PBR_SLOTS = ['albedo', 'color', 'normal', 'ao_emission', 'specular_ior']
-
-            result = {}  # {mat_idx: {role: (rgba, w, h, tex_name)}}
-
-            for mat_idx in mat_indices:
-                try:
-                    mat_name = None
-                    if mat_sec is not None:
-                        sec = bytes(mat_sec)
-                        ENTRY = 16
-                        if mat_idx * ENTRY + ENTRY <= len(sec):
-                            matfile_off, matname_off = struct.unpack_from('<QQ', sec, mat_idx * ENTRY)
-                            mat_name = dat1.get_string(matfile_off)
-
-                    if not mat_name:
-                        continue
-
-                    mat_name = mat_name.replace('\\', '/').lower()
-                    if not mat_name.endswith('.material'):
-                        mat_name += '.material'
-
-                    mat_asset_id = lookup.asset_id(mat_name)
-                    if mat_asset_id is None:
-                        mat_asset_id = lookup.asset_id(mat_name.lstrip('/'))
-                    if mat_asset_id is None:
-                        print(f"[texload] mat[{mat_idx}] path not found: {mat_name}")
-                        continue
-                    mat_entry = self.toc_parser.find_entry(mat_asset_id)
-                    if mat_entry is None:
-                        continue
-
-                    mat_data = self.toc_parser.extract_asset(mat_entry)
-                    mat_asset = parse_material_asset(mat_data)
-
-                    mat_result = {}
-
-                    # Decode every slot whose role is in our export set
-                    # This ensures both _g (albedo) and _c (color mask) are captured,
-                    # along with normal, ao_emission, and specular_ior.
-                    from exporters.texture_exporter import EXPORT_ROLES
-                    for slot in mat_asset.slots:
-                        if slot.role not in EXPORT_ROLES:
-                            continue
-                        # Use role+index as key so both _g and _c can coexist
-                        role_key = slot.role if slot.role not in mat_result else f"{slot.role}_{slot.index}"
-                        try:
-                            tex_path = slot.path.replace('\\', '/').lower()
-                            tex_id = lookup.asset_id(tex_path)
-                            if tex_id is None:
-                                tex_id = lookup.asset_id(tex_path.lstrip('/'))
-
-                            tex_entry = None
-                            if tex_id is not None:
-                                tex_entry = self.toc_parser.find_entry(tex_id)
-
-                            if tex_entry is None and slot.asset_id_lo:
-                                tex_entry = self.toc_parser.find_entry_by_id_lo(slot.asset_id_lo)
-
-                            if tex_entry is None:
-                                continue
-
-                            tex_data = self.toc_parser.extract_asset(tex_entry)
-                            tex = TextureParser(tex_data).parse()
-
-                            # Try to load HD pixel data
-                            if tex.hd_len > 0 and tex.hd_width > 0 and tex_id is not None:
-                                all_entries = self.toc_parser.find_all_entries(tex_id)
-                                hd_candidates = [e for e in all_entries if e.size > tex_entry.size]
-                                if hd_candidates:
-                                    hd_entry = max(hd_candidates, key=lambda e: e.size)
-                                    try:
-                                        hd_raw = self.toc_parser.extract_asset(hd_entry)
-                                        tex.hd_pixel_data = bytes(hd_raw)
-                                        if slot.role == 'albedo':
-                                            print(f"[texload] mat[{mat_idx}] HD {tex.hd_width}×{tex.hd_height} loaded ({len(hd_raw):,} bytes)")
-                                    except Exception:
-                                        pass
-
-                            rgba = tex.decode_to_rgba()
-                            if rgba:
-                                tex_name = slot.name
-                                w = tex.hd_width if tex.hd_pixel_data else tex.width
-                                h = tex.hd_height if tex.hd_pixel_data else tex.height
-                                mat_result[role_key] = (rgba, w, h, tex_name)
-                                if slot.role == 'albedo':
-                                    print(f"[texload] mat[{mat_idx}] '{mat_name}' albedo {w}×{h}")
-                                else:
-                                    print(f"[texload] mat[{mat_idx}] {slot.role} {w}×{h} ({tex_name})")
-
-                        except Exception as ex:
-                            print(f"[texload] mat[{mat_idx}] {slot.role} failed: {ex}")
-
-                    if mat_result:
-                        result[mat_idx] = mat_result
-
-                except Exception as ex:
-                    print(f"[texload] mat[{mat_idx}] failed: {ex}")
-
-            self.materials_ready.emit(result if result else {})
-
-        except Exception as ex:
-            import traceback
-            print(f"[texload] error: {ex}\n{traceback.format_exc()}")
-            self.materials_ready.emit({})
-            self.materials_ready.emit({})
 
 
 # ── Main Window ───────────────────────────────────────────────────────────────
