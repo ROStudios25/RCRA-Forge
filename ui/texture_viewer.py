@@ -81,6 +81,8 @@ class TextureViewer(QWidget):
         super().__init__(parent)
         self._texture: TextureAsset = None
         self._build_ui()
+        # Minimum: header(36) + canvas_min(200) + zoom_row(28) + info_strip(48)
+        self.setMinimumHeight(312)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -118,7 +120,7 @@ class TextureViewer(QWidget):
 
         # Canvas
         self._canvas = TextureCanvas()
-        self._canvas.setMinimumHeight(200)
+        self._canvas.setMinimumHeight(80)
         layout.addWidget(self._canvas, 1)
 
         # Zoom slider

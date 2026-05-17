@@ -3,21 +3,33 @@ core/zone.py
 ZoneDef DAT1 parser for RCRA Forge.
 
 Handles two zone entry formats:
-  GP zones  (gameplay tiles): entry_size=0xB0 (176 bytes), section has no header
-  ART zones (art/geometry):   entry_size=0x140 (320 bytes), section has 32-byte header
+  GP zones  (gameplay tiles): entry_size=0xB0 (176 bytes), section tag 0x06ABCAB2, no header
+  ART zones (art/geometry):   entry_size variable (0x140=320 confirmed for megalopolis),
+                               section tag 0x06ABCAB2, 32-byte section header.
+                               Entry size derived from TAG_MODEL_INDICES count,
+                               rounded to nearest multiple of 4.
 
-Both formats share the same field offsets:
-  +0x00 (36): rotation matrix (9 × f32, row-major 3×3)
-  +0x2C (4):  padding (always 0)
+Confirmed art zone entry field offsets (320-byte / 0x140 entries):
+  +0x00 (12): [cosθ, 0, sinθ] — row 0 of Y-axis rotation matrix (Y-axis rotation only confirmed)
+  +0x04 (4):  always 0.0 (row 0, element 1)
+  +0x10 (12): world position X, Y, Z (3 × f32)
+  +0x30 (12): bounding box half-extents or scale X, Y, Z (3 × f32) — NOT a second position
+  +0x5C (4):  flags word (0x80000140 typical)
+  +0xF0 (4):  model table index (u32) — direct index into TAG_MODEL_ASSETS u64[].
+              Value 0xFFFFFFFF = sentinel (no model, non-renderable node).
+
+TAG_MODEL_INDICES: u32[] of byte offsets into scene payload, one per model-bearing entry.
+  Used to determine which entries have models (presence set) and to derive entry count.
+  The actual model index is stored in the entry at +0xF0, NOT derived from list position.
+
+TAG_MODEL_ASSETS: u64[] of model asset IDs. Indexed directly by +0xF0 value.
+  Section size = n*8 + optional trailing padding bytes.
+
+GP zones confirmed field offsets:
+  +0x00 (36): rotation matrix (9 × f32)
   +0x30 (12): world position X, Y, Z (3 × f32)
-  +0x5C (4):  type/flags word
-
-GP zones additionally:
-  +0x80 (8):  instance_id (u64) — NOT the actor asset_id
-
-Art zones additionally:
-  Model references stored in section 0x6987F172 as u32 per entry
-  pointing into the model asset table (section 0xC6A5905E, u64 per entry)
+  +0x5C (4):  flags word
+  +0x80 (8):  instance_id (u64)
 
 Name/string pool: DAT1-internal, pool_base = 0x10 + section_count*12
 Actor/model paths stored as null-terminated strings in pool.
@@ -32,7 +44,9 @@ ZONE_DEF_TYPE      = 0x1F390AA0
 
 TAG_SCENE_NODES    = 0x06abcab2   # Scene node placement array (both formats)
 TAG_ENTRY_INDEX    = 0xdc625b3d   # Name/index table (gp zones: 4 bytes/entry; art: 72 bytes)
-TAG_MODEL_INDICES  = 0x6987F172   # Per-entry model index u32 (art zones only)
+TAG_MODEL_INDICES  = 0x6987F172   # Byte offsets (u32[]) into scene payload — one per model-bearing entry.
+                                   # Used to derive entry count and presence set.
+                                   # Model index is stored in entry at +0xF0, NOT from list position.
 TAG_MODEL_ASSETS   = 0xC6A5905E   # Model asset ID table u64[] (art zones only)
 
 GP_ENTRY_SIZE      = 0xB0    # 176 bytes
@@ -173,12 +187,27 @@ class ZoneParser:
 
     def _parse_nodes(self, scene_data, full_data, dat1_off,
                      index_data, mi_data, model_ids, is_art):
-        entry_size = ART_ENTRY_SIZE if is_art else GP_ENTRY_SIZE
-        header     = ART_SECTION_HEADER if is_art else 0
-
-        # Available data after header
+        header  = ART_SECTION_HEADER if is_art else 0
         payload = scene_data[header:]
-        n       = len(payload) // entry_size
+
+        if is_art:
+            # Derive true entry size from model_indices count.
+            # TAG_MODEL_INDICES has exactly one u32 per scene node, so:
+            #   entry_size = payload_size / model_indices_count
+            # Round to nearest multiple of 4 to handle integer division imprecision
+            # (e.g. 2212736 / 6889 = 321.2 → rounds to 320 = 0x140).
+            if mi_data:
+                mi_count   = len(mi_data) // 4
+                raw_size   = len(payload) / mi_count if mi_count > 0 else ART_ENTRY_SIZE
+                entry_size = int(round(raw_size / 4)) * 4
+            else:
+                entry_size = ART_ENTRY_SIZE
+            print(f"[zone] art zone entry_size={entry_size:#x} "
+                  f"payload={len(payload)} model_indices={len(mi_data)//4 if mi_data else 0}")
+        else:
+            entry_size = GP_ENTRY_SIZE
+
+        n = len(payload) // entry_size
 
         # Name offsets from index section
         name_offsets = []
@@ -194,12 +223,12 @@ class ZoneParser:
                 else:
                     name_offsets.append(0)
 
-        # Model indices (art zones only)
-        model_indices = []
+        # TAG_MODEL_INDICES: byte offsets marking model-bearing entries (presence set).
+        # Build as a set for O(1) lookup — used only to gate the +0xF0 read.
+        model_bearing_offsets = set()
         if is_art and mi_data:
-            mi_count = len(mi_data) // 4
-            model_indices = [struct.unpack_from('<I', mi_data, i*4)[0]
-                             for i in range(mi_count)]
+            for k in range(len(mi_data) // 4):
+                model_bearing_offsets.add(struct.unpack_from('<I', mi_data, k * 4)[0])
 
         entries = []
         for i in range(n):
@@ -209,17 +238,18 @@ class ZoneParser:
                 break
 
             if is_art:
-                # Art zone confirmed field offsets:
-                #   +0x00 (36): rotation matrix (9 × f32)
-                #   +0x10 (12): world position X, Y, Z (3 × f32)  ← NOT +0x30
-                #   +0x5C (4):  flags
-                #   +0xF0 (4):  model_index (u32, indexes into model_ids[])
+                # Confirmed field offsets (320-byte art zone entries):
+                #   +0x00 (12): [cosθ, 0, sinθ] — row 0 of Y-axis rotation matrix
+                #   +0x10 (12): world position X, Y, Z (3 × f32)
+                #   +0x5C (4):  flags word
+                #   +0xF0 (4):  model table index (u32) → indexes model_ids[].
+                #               0xFFFFFFFF = sentinel (no model).
                 rot      = struct.unpack_from('<9f', raw, 0x00)
                 x, y, z  = struct.unpack_from('<3f', raw, 0x10)
-                flags    = struct.unpack_from('<I',  raw, 0x5C)[0]
+                flags    = struct.unpack_from('<I',  raw, 0x5C)[0] if entry_size > 0x5C else 0
                 asset_id = 0
                 model_id = 0
-                if len(raw) >= 0xF4:
+                if base in model_bearing_offsets and entry_size >= 0xF4:
                     mi = struct.unpack_from('<I', raw, 0xF0)[0]
                     if mi < len(model_ids):
                         model_id = model_ids[mi]

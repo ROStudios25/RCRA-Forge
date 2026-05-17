@@ -545,7 +545,7 @@ class Viewport3D(QOpenGLWidget):
         if not _HAS_OPENGL:
             return
 
-        glClearColor(0.12, 0.13, 0.16, 1.0)
+        glClearColor(0.102, 0.110, 0.133, 1.0)  # matches BG_BASE #1a1c22
         glEnable(GL_DEPTH_TEST)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)

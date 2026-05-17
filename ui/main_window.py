@@ -4,6 +4,8 @@ RCRA Forge — Main Application Window
 """
 
 import os
+from core.theme import theme_manager
+from ui.preferences_dialog import PreferencesDialog
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QVBoxLayout, QHBoxLayout,
     QMenuBar, QMenu, QToolBar, QStatusBar, QFileDialog,
@@ -387,7 +389,7 @@ class MainWindow(QMainWindow):
         right_splitter.addWidget(top_splitter)
 
         self._viewport = Viewport3D()
-        self._viewport.setMinimumHeight(300)
+        self._viewport.setMinimumHeight(200)
         top_splitter.addWidget(self._viewport)
 
         self._props = PropertiesPanel()
@@ -400,10 +402,12 @@ class MainWindow(QMainWindow):
         # ── Bottom: tabbed panel [Texture | Scene | Skeleton | Hex] ──────────
         self._tab_panel = QTabWidget()
         self._tab_panel.setObjectName("BottomTabs")
-        self._tab_panel.setMinimumHeight(120)
+        self._tab_panel.setMinimumHeight(312)
         right_splitter.addWidget(self._tab_panel)
 
         right_splitter.setSizes([560, 220])
+        right_splitter.setStretchFactor(0, 1)  # viewport stretches
+        right_splitter.setStretchFactor(1, 0)  # bottom panel holds size
 
         # Tab: Texture viewer
         self._tex_viewer = TextureViewer()
@@ -468,6 +472,13 @@ class MainWindow(QMainWindow):
         act_quit.setShortcut(QKeySequence.StandardKey.Quit)
         act_quit.triggered.connect(QApplication.quit)
         file_m.addAction(act_quit)
+
+        # Edit
+        edit_m = mb.addMenu("Edit")
+        act_prefs = QAction("Preferences…", self)
+        act_prefs.setShortcut(QKeySequence("Ctrl+,"))
+        act_prefs.triggered.connect(self._open_preferences)
+        edit_m.addAction(act_prefs)
 
         # View
         view_m = mb.addMenu("View")
@@ -536,282 +547,7 @@ class MainWindow(QMainWindow):
     # ── Theming ───────────────────────────────────────────────────────────────
 
     def _apply_theme(self):
-        self.setStyleSheet("""
-        QMainWindow, QWidget {
-            background: #1a1c22;
-            color: #d4d8e0;
-            font-family: 'Segoe UI', 'SF Pro Text', 'Helvetica Neue', sans-serif;
-            font-size: 11px;
-        }
-        QMenuBar {
-            background: #13151a;
-            color: #c0c4cc;
-            border-bottom: 1px solid #2a2d36;
-            padding: 2px 0;
-        }
-        QMenuBar::item:selected { background: #2a2d36; }
-        QMenu {
-            background: #1e2028;
-            border: 1px solid #2a2d36;
-            color: #d0d4dc;
-        }
-        QMenu::item:selected { background: #3a6fbf; }
-        QToolBar {
-            background: #13151a;
-            border-bottom: 1px solid #2a2d36;
-            spacing: 4px;
-            padding: 2px 6px;
-        }
-        QToolBar QToolButton {
-            background: transparent;
-            border: 1px solid transparent;
-            border-radius: 4px;
-            padding: 3px 8px;
-            color: #c0c4cc;
-        }
-        QToolBar QToolButton:hover    { background: #2a2d36; border-color: #3a3d4a; }
-        QToolBar QToolButton:checked  { background: #253a5e; border-color: #3a6fbf; color: #5ba3f5; }
-        QSplitter::handle { background: #2a2d36; width: 4px; height: 4px; }
-        QSplitter::handle:hover { background: #3a6fbf; }
-        QSplitter::handle:pressed { background: #5dade2; }
-
-        /* Bottom tab panel */
-        #BottomTabs {
-            background: #13151a;
-            border-top: 2px solid #2a2d36;
-        }
-        #BottomTabs QTabBar::tab {
-            background: #1a1c22;
-            color: #606878;
-            border: none;
-            border-bottom: 2px solid transparent;
-            padding: 5px 14px;
-            font-size: 10px;
-            font-weight: 600;
-            letter-spacing: 0.5px;
-        }
-        #BottomTabs QTabBar::tab:hover    { color: #a0b0c8; background: #1e2028; }
-        #BottomTabs QTabBar::tab:selected {
-            color: #5ba3f5;
-            border-bottom: 2px solid #3a6fbf;
-            background: #1a1c22;
-        }
-        #BottomTabs QTabWidget::pane { border: none; }
-
-        /* Browser / panel frames */
-        #BrowserHeader {
-            background: #13151a;
-            border-bottom: 1px solid #2a2d36;
-        }
-        #PanelTitle {
-            font-size: 10px;
-            font-weight: 600;
-            letter-spacing: 1.5px;
-            color: #6a7080;
-        }
-        #FilterBar { background: #16181f; border-bottom: 1px solid #2a2d36; }
-        #SearchBox {
-            background: #1e2028;
-            border: 1px solid #2a2d36;
-            border-radius: 4px;
-            padding: 3px 6px;
-            color: #d0d4dc;
-        }
-        #SearchBox:focus { border-color: #3a6fbf; }
-        #TypeFilter {
-            background: #1e2028;
-            border: 1px solid #2a2d36;
-            border-radius: 4px;
-            color: #c0c4cc;
-        }
-        #AssetTree {
-            background: #1a1c22;
-            border: none;
-            color: #c0c8d8;
-            alternate-background-color: #1d1f26;
-            selection-background-color: #253a5e;
-        }
-        #AssetTree::item { padding: 2px 4px; border-radius: 2px; }
-        #AssetTree::item:hover    { background: #22263a; }
-        #AssetTree::item:selected { background: #253a5e; color: #ffffff; }
-        #StatusLabel {
-            font-size: 10px;
-            color: #606570;
-            background: #13151a;
-            border-top: 1px solid #2a2d36;
-        }
-        #SubPanelLabel {
-            background: #161820;
-            color: #505868;
-            font-size: 10px;
-            font-weight: 600;
-            letter-spacing: 1px;
-            border-bottom: 1px solid #2a2d36;
-            padding-left: 8px;
-        }
-
-        /* Properties panel */
-        QGroupBox {
-            font-size: 10px;
-            font-weight: 600;
-            color: #6a7080;
-            border: 1px solid #2a2d36;
-            border-radius: 6px;
-            margin-top: 12px;
-            padding-top: 8px;
-        }
-        QGroupBox::title {
-            subcontrol-origin: margin;
-            subcontrol-position: top left;
-            padding: 0 6px;
-            left: 8px;
-        }
-        #FieldValue {
-            color: #b0bcd0;
-            font-family: 'Consolas', 'JetBrains Mono', monospace;
-            font-size: 11px;
-        }
-        #FmtCombo {
-            background: #1e2028;
-            border: 1px solid #2a2d36;
-            border-radius: 4px;
-            padding: 2px 6px;
-            color: #c0c4cc;
-        }
-        QCheckBox { color: #a0a8b8; }
-        QCheckBox::indicator {
-            width: 13px; height: 13px;
-            border: 1px solid #3a3d4a;
-            border-radius: 3px;
-            background: #1e2028;
-        }
-        QCheckBox::indicator:checked { background: #3a6fbf; border-color: #5a90df; }
-        #ExportBtn {
-            background: #1f4a8f;
-            border: 1px solid #3a70cf;
-            border-radius: 5px;
-            padding: 6px 12px;
-            color: #e0eaff;
-            font-weight: 600;
-            font-size: 12px;
-        }
-        #ExportBtn:hover   { background: #2560af; }
-        #ExportBtn:pressed { background: #143a7a; }
-        #ExportBtn:disabled { background: #1e2028; color: #404550; border-color: #2a2d36; }
-        #ExportStatus { color: #80b0e0; font-size: 10px; }
-
-        /* Groups toggle button in asset browser header */
-        #GroupsToggleBtn {
-            background: transparent;
-            border: 1px solid #3a3d4a;
-            border-radius: 4px;
-            padding: 2px 8px;
-            color: #90a0b8;
-            font-size: 10px;
-            font-weight: 500;
-        }
-        #GroupsToggleBtn:hover   { background: #252830; border-color: #f0a500; color: #f0c040; }
-        #GroupsToggleBtn:checked { background: #2a2210; border-color: #f0a500; color: #f0a500; font-weight: 700; }
-        #GroupsToggleBtn:checked:hover { background: #3a2e10; }
-        #LogBox {
-            background: #13151a;
-            border: 1px solid #2a2d36;
-            border-radius: 4px;
-            color: #607090;
-            font-family: 'Consolas', 'Courier New', monospace;
-            font-size: 10px;
-        }
-        #GamePathLabel { color: #404858; font-size: 10px; }
-
-        /* Texture viewer */
-        #ZoomRow { background: #161820; border-top: 1px solid #2a2d36; }
-        #TexInfo { background: #13151a; border-top: 1px solid #2a2d36; }
-        #TexInfoKey { color: #405060; font-size: 9px; font-weight: 600; letter-spacing: 1px; }
-        #TexInfoVal { color: #90b8d8; font-family: 'Consolas', monospace; font-size: 11px; }
-
-        /* Instance table */
-        #InstTable {
-            background: #1a1c22;
-            alternate-background-color: #1d1f26;
-            border: none;
-            color: #a0b8c8;
-            gridline-color: #2a2d36;
-            selection-background-color: #253a5e;
-        }
-        #InstTable QHeaderView::section {
-            background: #13151a;
-            color: #506070;
-            border: none;
-            border-bottom: 1px solid #2a2d36;
-            padding: 3px 6px;
-            font-size: 10px;
-            font-weight: 600;
-        }
-
-        /* Scrollbars */
-        QScrollBar:vertical {
-            background: #13151a;
-            width: 10px;
-            border: none;
-        }
-        QScrollBar::handle:vertical {
-            background: #2a3040;
-            border-radius: 4px;
-            min-height: 20px;
-        }
-        QScrollBar::handle:vertical:hover { background: #3a4560; }
-        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-        QScrollBar:horizontal {
-            background: #13151a;
-            height: 10px;
-            border: none;
-        }
-        QScrollBar::handle:horizontal {
-            background: #2a3040;
-            border-radius: 4px;
-            min-width: 20px;
-        }
-        QScrollBar::handle:horizontal:hover { background: #3a4560; }
-        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
-
-        /* Sliders */
-        QSlider::groove:horizontal {
-            background: #2a2d36;
-            height: 3px;
-            border-radius: 2px;
-        }
-        QSlider::handle:horizontal {
-            background: #3a6fbf;
-            width: 12px; height: 12px;
-            margin: -5px 0;
-            border-radius: 6px;
-        }
-
-        /* Status bar */
-        QStatusBar {
-            background: #13151a;
-            border-top: 1px solid #2a2d36;
-            color: #606070;
-            font-size: 10px;
-        }
-        QProgressBar {
-            background: #1e2028;
-            border: 1px solid #2a2d36;
-            border-radius: 3px;
-            height: 6px;
-        }
-        QProgressBar::chunk { background: #3a6fbf; border-radius: 3px; }
-
-        QPushButton {
-            background: #1e2028;
-            border: 1px solid #2a2d36;
-            border-radius: 4px;
-            padding: 3px 8px;
-            color: #c0c4cc;
-        }
-        QPushButton:hover { background: #252830; border-color: #3a3d4a; }
-        QPushButton:pressed { background: #1a1c24; }
-        """)
+        self._load_config()
 
     # ── Actions ───────────────────────────────────────────────────────────────
 
@@ -1145,7 +881,18 @@ class MainWindow(QMainWindow):
         progress = QProgressDialog("Assembling zone...", "Cancel", 0, zone.entry_count, self)
         progress.setWindowTitle("Zone Export")
         progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumWidth(360)
         progress.show()
+        # Style the dialog's internal progress bar for readability
+        from PyQt6.QtWidgets import QProgressBar as _QPB
+        _bar = progress.findChild(_QPB)
+        if _bar:
+            _bar.setStyleSheet(
+                "QProgressBar { height: 20px; color: #e0e4ef; text-align: center; "
+                "font-size: 11px; background: #1e2028; border: 1px solid #2a2d36; "
+                "border-radius: 3px; } "
+                "QProgressBar::chunk { background: #3a6fbf; border-radius: 3px; }"
+            )
 
         try:
             from core.level_assembler import LevelAssembler, export_zone_glb
@@ -1225,6 +972,43 @@ class MainWindow(QMainWindow):
         dlg.exec()
         # Always reload so viewport picks up any saved changes
         self._viewport.reload_controls()
+
+    def _open_preferences(self):
+        """Open the Preferences dialog (theme / colour customisation)."""
+        def apply_fn(qss: str):
+            self.setStyleSheet(qss)
+        dlg = PreferencesDialog(apply_fn, self)
+        if dlg.exec():
+            self._save_config()
+
+    def _save_config(self):
+        """Persist current theme to config.json next to the executable."""
+        import json, os
+        cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+        try:
+            existing = {}
+            if os.path.exists(cfg_path):
+                with open(cfg_path, 'r') as f:
+                    existing = json.load(f)
+            existing["theme"] = theme_manager.to_dict()
+            with open(cfg_path, 'w') as f:
+                json.dump(existing, f, indent=2)
+        except Exception as ex:
+            print(f"[config] failed to save: {ex}")
+
+    def _load_config(self):
+        """Load theme (and other settings) from config.json."""
+        import json, os
+        cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+        try:
+            if os.path.exists(cfg_path):
+                with open(cfg_path, 'r') as f:
+                    cfg = json.load(f)
+                if "theme" in cfg:
+                    theme_manager.from_dict(cfg["theme"])
+                    self.setStyleSheet(theme_manager.stylesheet())
+        except Exception as ex:
+            print(f"[config] failed to load: {ex}")
 
     def _show_about(self):
         QMessageBox.about(self, "About RCRA Forge",
