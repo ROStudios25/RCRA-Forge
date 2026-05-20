@@ -185,7 +185,7 @@ def load_model_textures(model, entry, toc_parser, lookup) -> dict:
         from core.material import parse_material_asset
         from core.texture import TextureParser
         from core.archive import DAT1
-        from exporters.texture_exporter import EXPORT_ROLES
+        from exporters.texture_exporter import EXPORT_ROLES, _role_in_export_roles
 
         if not lookup or not lookup.is_loaded():
             return {}
@@ -224,7 +224,7 @@ def load_model_textures(model, entry, toc_parser, lookup) -> dict:
 
                 mat_result = {}
                 for slot in mat_asset.slots:
-                    if slot.role not in EXPORT_ROLES:
+                    if not _role_in_export_roles(slot.role):
                         continue
                     role_key = slot.role if slot.role not in mat_result else f"{slot.role}_{slot.index}"
                     _decode_slot(
@@ -301,15 +301,16 @@ def _decode_slot(slot, role_key: str, mat_idx: int, mat_name: str,
                     pass
 
         rgba = tex.decode_to_rgba()
-        if rgba:
-            tex_name = slot.name
-            w = tex.hd_width  if tex.hd_pixel_data else tex.width
-            h = tex.hd_height if tex.hd_pixel_data else tex.height
-            mat_result[role_key] = (rgba, w, h, tex_name)
-            if slot.role == 'albedo':
-                print(f"[texload] mat[{mat_idx}] '{mat_name}' albedo {w}×{h}")
-            else:
-                print(f"[texload] mat[{mat_idx}] {slot.role} {w}×{h} ({tex_name})")
+        if not rgba:
+            return
+        tex_name = slot.name
+        w = tex.hd_width  if tex.hd_pixel_data else tex.width
+        h = tex.hd_height if tex.hd_pixel_data else tex.height
+        mat_result[role_key] = (rgba, w, h, tex_name)
+        if slot.role == 'albedo':
+            print(f"[texload] mat[{mat_idx}] '{mat_name}' albedo {w}×{h}")
+        else:
+            print(f"[texload] mat[{mat_idx}] {slot.role} {w}×{h} ({tex_name})")
 
     except Exception as ex:
         print(f"[texload] mat[{mat_idx}] {slot.role} failed: {ex}")

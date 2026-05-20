@@ -839,7 +839,7 @@ class MainWindow(QMainWindow):
 
     def _show_about(self):
         QMessageBox.about(self, "About RCRA Forge",
-            "<h3>RCRA Forge v0.5.5</h3>"
+            "<h3>RCRA Forge v0.5.7</h3>"
             "<p>Ratchet &amp; Clank: Rift Apart level editor and model exporter.</p>"
             "<p>Format reverse engineering credit:<br>"
             "&nbsp;• chaoticgd / <i>ripped_apart</i> (MIT)<br>"

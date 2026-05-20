@@ -63,21 +63,44 @@ uniform vec3      uFillDir;
 uniform vec3      uBaseColor;
 uniform bool      uWireframe;
 uniform bool      uHasTexture;
+uniform bool      uHasNormal;
 uniform sampler2D uAlbedo;
+uniform sampler2D uNormalMap;
 
 out vec4 FragColor;
+
+// Simple normal perturbation — offsets vertex normal by normal map XY.
+// More stable than full cotangent TBN at large world scales.
+vec3 perturb_normal(vec3 N, vec2 uv, sampler2D nmap) {
+    vec3 nm = texture(nmap, uv).rgb * 2.0 - 1.0;
+    // BC5 RG normal map — reconstruct Z
+    nm.z = sqrt(max(0.001, 1.0 - dot(nm.xy, nm.xy)));
+    // Build a simple local frame from vertex normal
+    vec3 up    = abs(N.z) < 0.999 ? vec3(0,0,1) : vec3(1,0,0);
+    vec3 T     = normalize(cross(up, N));
+    vec3 B     = cross(N, T);
+    // Blend: use nm.xy to perturb N, keep Z influence from vertex normal
+    vec3 perturbed = normalize(T * nm.x + B * nm.y + N * (nm.z + 0.5));
+    return perturbed;
+}
 
 void main() {
     if (uWireframe) {
         FragColor = vec4(0.2, 0.8, 1.0, 1.0);
         return;
     }
-    // Two-sided lighting: use abs(dot) so inverted normals still receive light.
-    // This handles cases where vertex normals point inward on some sub-meshes.
-    vec3 n    = normalize(vNormal);
+
+    vec3 n = normalize(vNormal);
+
+    if (uHasNormal) {
+        n = perturb_normal(n, vUV, uNormalMap);
+    }
+
+    // Two-sided lighting
     float NdL  = abs(dot(n, normalize(uLightDir)));
     float NdL2 = abs(dot(n, normalize(uFillDir)));
     float light = NdL * 0.8 + NdL2 * 0.3 + 0.35;
+
     vec3 col;
     if (uHasTexture) {
         vec3 tex = texture(uAlbedo, vUV).rgb;
@@ -226,7 +249,8 @@ class GpuSubMesh:
         self.index_count: int = 0
         self.index_type: int = 0   # GL_UNSIGNED_SHORT or GL_UNSIGNED_INT
         self.color: tuple = (0.75, 0.75, 0.75)
-        self.texture_id: int = 0   # OpenGL texture object, 0 = no texture
+        self.texture_id:    int = 0   # OpenGL texture object, 0 = no texture
+        self.normal_tex_id: int = 0   # OpenGL normal map texture, 0 = none
         self.material_index: int = -1  # model material index for texture lookup
         self.is_fur: bool = False     # fur/composite shell mesh — can be toggled
 
@@ -291,6 +315,9 @@ class GpuSubMesh:
         if self.texture_id:
             glDeleteTextures(1, [self.texture_id])
             self.texture_id = 0
+        if self.normal_tex_id:
+            glDeleteTextures(1, [self.normal_tex_id])
+            self.normal_tex_id = 0
 
 
 # ── Viewport Widget ───────────────────────────────────────────────────────────
@@ -375,19 +402,39 @@ class Viewport3D(QOpenGLWidget):
         Accepts both old format {mat_idx: (rgba,w,h)} and new format
         {mat_idx: {role: (rgba,w,h,tex_name)}} — uses albedo role for viewport."""
         import ctypes
-        gl_tex_map = {}   # material_index → gl texture id
+        gl_tex_map:    dict = {}   # material_index → albedo gl texture id
+        gl_nrm_map:    dict = {}   # material_index → normal gl texture id
 
         for mat_idx, data in material_textures.items():
             # New multi-slot format: {role: (rgba, w, h, tex_name)}
             if isinstance(data, dict):
-                # Strict priority for viewport display: base_color → color_id → skip others
-                slot = data.get('base_color') or data.get('color_id')
-                if slot is None:
-                    continue   # don't fall back to normal/specular for viewport
-                rgba_bytes, w, h = slot[0], slot[1], slot[2]
+                # Find the best base_color slot — prefer largest resolution.
+                # Multiple base_color slots exist when armorcolor (64×1) and
+                # the main diffuse (2048×2048) are both present; pick biggest.
+                best_slot = None
+                best_pixels = 0
+                for role_key, slot_data in data.items():
+                    if role_key == 'base_color' or role_key.startswith('base_color_') \
+                            or role_key == 'color_id' or role_key.startswith('color_id_'):
+                        px = slot_data[1] * slot_data[2]  # w * h
+                        if px > best_pixels and slot_data[0]:
+                            best_slot = slot_data
+                            best_pixels = px
+                if best_slot is None:
+                    continue
+                rgba_bytes, w, h = best_slot[0], best_slot[1], best_slot[2]
+
+                # Also grab normal map slot
+                nrm_slot = data.get('normal')
+                if nrm_slot is None:
+                    for rk, sd in data.items():
+                        if rk == 'normal' or rk.startswith('normal_'):
+                            nrm_slot = sd
+                            break
             else:
                 # Legacy format: (rgba, w, h)
                 rgba_bytes, w, h = data[0], data[1], data[2]
+                nrm_slot = None
 
             if not rgba_bytes or w == 0 or h == 0:
                 continue
@@ -408,12 +455,31 @@ class Viewport3D(QOpenGLWidget):
             except Exception as ex:
                 print(f"[viewport] texture upload failed mat={mat_idx}: {ex}")
 
-        # Assign textures directly by stored material_index — no iterator sync needed
-        for gm in self._gpu_meshes:
-            gm.texture_id = 0
+            # Upload normal map if available
+            if nrm_slot and nrm_slot[0]:
+                nw, nh = nrm_slot[1], nrm_slot[2]
+                try:
+                    nrm_id = int(glGenTextures(1))
+                    glBindTexture(GL_TEXTURE_2D, nrm_id)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT)
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, nw, nh, 0,
+                                 GL_RGBA, GL_UNSIGNED_BYTE,
+                                 (ctypes.c_uint8 * len(nrm_slot[0]))(*nrm_slot[0]))
+                    glGenerateMipmap(GL_TEXTURE_2D)
+                    glBindTexture(GL_TEXTURE_2D, 0)
+                    gl_nrm_map[mat_idx] = nrm_id
+                except Exception as ex:
+                    print(f"[viewport] normal upload failed mat={mat_idx}: {ex}")
+
+        # Only update meshes whose material_index appears in the new batch.
         for gm in self._gpu_meshes:
             if gm.material_index in gl_tex_map:
                 gm.texture_id = gl_tex_map[gm.material_index]
+            if gm.material_index in gl_nrm_map:
+                gm.normal_tex_id = gl_nrm_map[gm.material_index]
 
     def set_lod(self, lod_idx: int):
         """Switch the viewport to show a different LOD level."""
@@ -456,6 +522,7 @@ class Viewport3D(QOpenGLWidget):
             if positions is None or indices is None or len(positions) == 0:
                 skipped += 1
                 continue
+
             gpu = GpuSubMesh()
             gpu.material_index = mesh.material_index
 
@@ -464,12 +531,7 @@ class Viewport3D(QOpenGLWidget):
             if model.material_names and mesh.material_index < len(model.material_names):
                 mat_name = model.material_names[mesh.material_index].lower()
             gpu.is_fur = any(kw in mat_name for kw in FUR_KEYWORDS)
-            positions, normals, uvs, indices = mesh_to_numpy(model, mesh)
-            if positions is None or indices is None or len(positions) == 0:
-                skipped += 1
-                continue
-            gpu = GpuSubMesh()
-            gpu.material_index = mesh.material_index
+
             try:
                 gpu.upload(positions, normals, uvs, indices)
                 if gpu.vao == 0:
@@ -630,10 +692,13 @@ class Viewport3D(QOpenGLWidget):
             _set_uniform_3f(self._shader_prog, 'uFillDir',  *fill_dir)
             _set_uniform_bool(self._shader_prog, 'uWireframe', self._wireframe)
 
-            # Bind texture sampler to unit 0
+            # Bind texture samplers
             loc_albedo = glGetUniformLocation(self._shader_prog, 'uAlbedo')
             if loc_albedo >= 0:
                 glUniform1i(loc_albedo, 0)
+            loc_nrm = glGetUniformLocation(self._shader_prog, 'uNormalMap')
+            if loc_nrm >= 0:
+                glUniform1i(loc_nrm, 1)
 
             if self._wireframe:
                 glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)
@@ -644,13 +709,22 @@ class Viewport3D(QOpenGLWidget):
                 if gm.is_fur and not self._show_fur:
                     continue
                 has_tex = gm.texture_id > 0 and not self._wireframe
+                has_nrm = gm.normal_tex_id > 0 and not self._wireframe
                 _set_uniform_bool(self._shader_prog, 'uHasTexture', has_tex)
+                _set_uniform_bool(self._shader_prog, 'uHasNormal', has_nrm)
                 _set_uniform_3f(self._shader_prog, 'uBaseColor', *gm.color)
                 if has_tex:
                     glActiveTexture(GL_TEXTURE0)
                     glBindTexture(GL_TEXTURE_2D, gm.texture_id)
+                if has_nrm:
+                    glActiveTexture(GL_TEXTURE1)
+                    glBindTexture(GL_TEXTURE_2D, gm.normal_tex_id)
                 gm.draw()
                 if has_tex:
+                    glActiveTexture(GL_TEXTURE0)
+                    glBindTexture(GL_TEXTURE_2D, 0)
+                if has_nrm:
+                    glActiveTexture(GL_TEXTURE1)
                     glBindTexture(GL_TEXTURE_2D, 0)
 
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
@@ -783,7 +857,10 @@ class Viewport3D(QOpenGLWidget):
         for gm in self._gpu_meshes:
             if gm.texture_id:
                 unique_tex_ids.add(int(gm.texture_id))
+            if gm.normal_tex_id:
+                unique_tex_ids.add(int(gm.normal_tex_id))
             gm.texture_id = 0  # prevent gm.free() from deleting it
+            gm.normal_tex_id = 0
 
         for gm in self._gpu_meshes:
             gm.free()

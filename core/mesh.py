@@ -171,10 +171,15 @@ class ModelParser:
                 u_raw, v_raw = struct.unpack_from('<hh', uv1_data, i * 4)
                 vertexes[i].u1 = u_raw * uv_scale
                 vertexes[i].v1 = v_raw * uv_scale
-            # UV1 is the primary UV channel for RCRA models — copy to u/v
-            for i in range(min(len(vertexes), len(uv1_data) // 4)):
-                vertexes[i].u = vertexes[i].u1
-                vertexes[i].v = vertexes[i].v1
+            # Only promote UV1 to primary channel if vertex buffer UVs appear absent
+            # (all zero), which happens for some environment/prop models but NOT for
+            # skinned character models which store primary UVs in the vertex buffer.
+            all_zero = all(vertexes[i].u == 0.0 and vertexes[i].v == 0.0
+                          for i in range(min(len(vertexes), 16)))
+            if all_zero:
+                for i in range(min(len(vertexes), len(uv1_data) // 4)):
+                    vertexes[i].u = vertexes[i].u1
+                    vertexes[i].v = vertexes[i].v1
 
         # Vertex colours
         col_data = dat1.get_section(TAG_COLORS)
@@ -208,13 +213,19 @@ class ModelParser:
         data = dat1.get_section(TAG_VERTEXES)
         if not data:
             return []
-        vertexes = []
-        SCALE = 1.0 / 4096.0
-        UV_SCALE = uv_scale
 
-        for i in range(0, len(data) - 15, 16):
-            X, Y, Z, _W, NXYZ, U, V = struct.unpack_from('<4hI2h', data, i)
-            nx, ny, nz = _decode_normal(NXYZ)
+        SCALE    = 1.0 / 4096.0
+        UV_SCALE = uv_scale
+        vertexes = []
+
+        n_verts = len(data) // 16
+        for i in range(n_verts):
+            off = i * 16
+            X, Y, Z, _W = struct.unpack_from('<4h', data, off)
+            NXYZ        = struct.unpack_from('<I',  data, off + 8)[0]
+            nx, ny, nz  = _decode_normal(NXYZ)
+            U, V        = struct.unpack_from('<2h', data, off + 12)
+
             vertexes.append(Vertex(
                 x  = X * SCALE, y  = Y * SCALE, z  = Z * SCALE,
                 nx = nx,        ny = ny,        nz = nz,

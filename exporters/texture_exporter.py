@@ -67,6 +67,17 @@ EXPORT_ROLES = {
 }
 
 
+def _role_in_export_roles(role: str) -> bool:
+    """Match exact role or indexed variant (e.g. 'base_color_1', 'normal_2')."""
+    if role in EXPORT_ROLES:
+        return True
+    # Strip trailing _N index and check base role
+    parts = role.rsplit('_', 1)
+    if len(parts) == 2 and parts[1].isdigit() and parts[0] in EXPORT_ROLES:
+        return True
+    return False
+
+
 # ── Data classes ──────────────────────────────────────────────────────────────
 
 @dataclass
@@ -270,7 +281,7 @@ class TextureExporter:
             mat_name = self.mat_names.get(mat_idx, f'mat{mat_idx}')
 
             for role, (rgba, w, h, tex_name) in roles.items():
-                if role not in EXPORT_ROLES:
+                if not _role_in_export_roles(role):
                     continue
 
                 et = ExportedTexture(
@@ -315,7 +326,7 @@ class TextureExporter:
             results[mat_idx] = {}
             mat_name = self.mat_names.get(mat_idx, f'mat{mat_idx}')
             for role, (rgba, w, h, tex_name) in roles.items():
-                if role not in EXPORT_ROLES:
+                if not _role_in_export_roles(role):
                     continue
                 et = ExportedTexture(
                     role=role, mat_name=mat_name,

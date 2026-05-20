@@ -155,8 +155,8 @@ class TextureAsset:
             }
             bcn = BCN_MAP.get(self.fmt)
             if bcn is None:
-                # Uncompressed R8G8B8A8
-                if self.fmt == 0x1C:
+                # Uncompressed R8G8B8A8 (both linear and sRGB variants)
+                if self.fmt in (0x1C, 0x1D):
                     return bytes(data[:w * h * 4])
                 return None
 
@@ -167,8 +167,18 @@ class TextureAsset:
             elif bcn == 5:
                 channels = 2
 
+            # Bytes per BCn block (all BCn formats use 4×4 pixel blocks)
+            bytes_per_block = 8 if bcn in (1, 4) else 16  # BC1/BC4=8, others=16
+            blocks_w = max(1, (w + 3) // 4)
+            blocks_h = max(1, (h + 3) // 4)
+            mip0_size = blocks_w * blocks_h * bytes_per_block
+
+            # Truncate to first mip level only — imagecodecs doesn't handle
+            # mip chains and returns zeros if extra bytes are present.
+            mip0_data = data[:mip0_size]
+
             shape = (h, w, channels) if channels > 1 else (h, w)
-            arr = imagecodecs.bcn_decode(data, format=bcn, shape=shape)
+            arr = imagecodecs.bcn_decode(mip0_data, format=bcn, shape=shape)
             arr = arr.astype(np.uint8)
 
             # Normalize to RGBA
@@ -188,7 +198,7 @@ class TextureAsset:
             else:  # BC1/BC2/BC3/BC7 already RGBA
                 return arr.tobytes()
         except Exception as ex:
-            print(f"[texture] decode_to_rgba failed: {ex}")
+            print(f"[texture] decode_to_rgba failed fmt={self.fmt:#x}: {ex}")
             return None
 
     def to_png_bytes(self) -> Optional[bytes]:
