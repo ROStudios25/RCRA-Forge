@@ -369,7 +369,9 @@ class FbxExporter:
                 eu.child("Name",                     "UVMap")
                 eu.child("MappingInformationType",   "ByPolygonVertex")
                 eu.child("ReferenceInformationType", "IndexToDirect")
-                eu.child("UV", uvs.flatten().astype(np.float64))
+                uvs_flipped = uvs.copy()
+                uvs_flipped[:, 1] = 1.0 - uvs_flipped[:, 1]
+                eu.child("UV", uvs_flipped.flatten().astype(np.float64))
                 uv_idx = np.where(fbx_idx < 0, -(fbx_idx + 1), fbx_idx).astype(np.int32)
                 eu.child("UVIndex", uv_idx)
 

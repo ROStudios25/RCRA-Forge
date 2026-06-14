@@ -269,8 +269,11 @@ class GltfExporter:
             attribs["NORMAL"] = self._add_accessor(
                 normals, "VEC3", GLTF_FLOAT, GLTF_ARRAY_BUFFER)
         if uvs is not None:
+            import numpy as np
+            uvs_flipped = uvs.copy()
+            uvs_flipped[:, 1] = 1.0 - uvs_flipped[:, 1]
             attribs["TEXCOORD_0"] = self._add_accessor(
-                uvs, "VEC2", GLTF_FLOAT, GLTF_ARRAY_BUFFER)
+                uvs_flipped, "VEC2", GLTF_FLOAT, GLTF_ARRAY_BUFFER)
 
         if self.model.joints and self.model.rcra_weights:
             j_arr, w_arr = self._build_skin_arrays(mesh)
